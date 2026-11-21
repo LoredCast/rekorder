@@ -1,0 +1,7 @@
+v1.1.0:
+• Live real-time DSP auditioning during playback + A-B Trim Loop
+• Marker navigation (<MK/+MK/MK>), naming/deletion & Split-at-Markers export
+• Cut-Out Middle + smooth Fade-In/Fade-Out on export
+• Noise Gate, 50/60 Hz De-Hum notch, BS.1770 LUFS normalizer & Preset JSON backup
+• Auto-pause on incoming calls, BT SCO mic routing, Silence Skip (VOX) & Auto-Stop timer
+• Open With audio files, Recordings sort & batch select, 1x1 Record Widget, Shortcut, Vol-key trigger & landscape UI

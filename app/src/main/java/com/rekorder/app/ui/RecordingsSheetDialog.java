@@ -32,17 +32,20 @@ import com.rekorder.app.storage.WaveformCache;
 
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
  * Pitch-black (#000000) AMOLED modal listing WAV, RAW, FLAC, OGG & MP3 recordings
- * with live search/filter, async O(1) duration probes, rename, share, and delete.
+ * with live search/filter, sorting, multi-select batch share/delete, async O(1) duration probes, and rename.
  */
 public final class RecordingsSheetDialog extends Dialog {
 
@@ -50,7 +53,17 @@ public final class RecordingsSheetDialog extends Dialog {
         void onSelectRecording(RecordingStorage.RecordingItem item);
         void onRenameRecording(RecordingStorage.RecordingItem oldItem, RecordingStorage.RecordingItem newItem);
         void onShareRecording(RecordingStorage.RecordingItem item);
+        void onShareMultiple(List<RecordingStorage.RecordingItem> items);
         void onDeleteRecording(RecordingStorage.RecordingItem item);
+    }
+
+    private enum SortMode {
+        NEWEST("NEWEST"),
+        NAME("NAME"),
+        SIZE("SIZE"),
+        DURATION("LENGTH");
+        final String label;
+        SortMode(String label) { this.label = label; }
     }
 
     private final Listener listener;
@@ -62,8 +75,16 @@ public final class RecordingsSheetDialog extends Dialog {
 
     private List<RecordingStorage.RecordingItem> allItems;
     private String currentQuery = "";
+    private SortMode sortMode = SortMode.NEWEST;
+    private boolean selectionMode = false;
+    private final Set<String> selectedNames = new HashSet<>();
     private LinearLayout listContainer;
     private TextView headerTitle;
+    private TextView selectToggleBtn;
+    private TextView sortBtn;
+    private LinearLayout batchBar;
+    private TextView batchShareBtn;
+    private TextView batchDeleteBtn;
 
     public RecordingsSheetDialog(Context ctx, List<RecordingStorage.RecordingItem> items, Listener listener) {
         super(ctx, R.style.Theme_Rekorder_Dialog);
@@ -122,6 +143,20 @@ public final class RecordingsSheetDialog extends Dialog {
         headerTitle.setLetterSpacing(0.14f);
         header.addView(headerTitle, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
+        if (!allItems.isEmpty()) {
+            selectToggleBtn = smallPill(ctx, "SELECT", 0xFF9A9A9A, 0xFF282828);
+            LinearLayout.LayoutParams stLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            stLp.rightMargin = dp(8);
+            selectToggleBtn.setOnClickListener(v -> {
+                selectionMode = !selectionMode;
+                if (!selectionMode) selectedNames.clear();
+                updateSelectionUi(ctx);
+                populateList(ctx);
+            });
+            header.addView(selectToggleBtn, stLp);
+        }
+
         TextView close = new TextView(ctx);
         close.setText("CLOSE");
         close.setTextColor(0xFF888888);
@@ -141,10 +176,17 @@ public final class RecordingsSheetDialog extends Dialog {
         pathTv.setPadding(dp(20), 0, dp(20), dp(10));
         root.addView(pathTv);
 
-        // Search / Filter bar
+        // Search / Filter + Sort bar
         if (!allItems.isEmpty()) {
+            LinearLayout searchRow = new LinearLayout(ctx);
+            searchRow.setOrientation(LinearLayout.HORIZONTAL);
+            searchRow.setGravity(Gravity.CENTER_VERTICAL);
+            LinearLayout.LayoutParams srlp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            srlp.setMargins(dp(16), 0, dp(16), dp(10));
+
             EditText searchEt = new EditText(ctx);
-            searchEt.setHint("Search name or format (wav, flac, mp3, ogg)...");
+            searchEt.setHint("Search name or format...");
             searchEt.setHintTextColor(0xFF555555);
             searchEt.setTextColor(0xFFF0F0F0);
             searchEt.setTextSize(12f);
@@ -165,10 +207,20 @@ public final class RecordingsSheetDialog extends Dialog {
                 }
                 @Override public void afterTextChanged(Editable s) {}
             });
-            LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-            slp.setMargins(dp(16), 0, dp(16), dp(10));
-            root.addView(searchEt, slp);
+            searchRow.addView(searchEt, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+            sortBtn = smallPill(ctx, "SORT: " + sortMode.label, 0xFFE0E0E0, 0xFF282828);
+            LinearLayout.LayoutParams sortLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            sortLp.leftMargin = dp(8);
+            sortBtn.setOnClickListener(v -> {
+                SortMode[] vals = SortMode.values();
+                sortMode = vals[(sortMode.ordinal() + 1) % vals.length];
+                sortBtn.setText("SORT: " + sortMode.label);
+                populateList(ctx);
+            });
+            searchRow.addView(sortBtn, sortLp);
+            root.addView(searchRow, srlp);
         }
 
         View sep = new View(ctx);
@@ -183,19 +235,130 @@ public final class RecordingsSheetDialog extends Dialog {
         scroll.addView(listContainer);
         root.addView(scroll, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
+        // Batch action bar (hidden unless multi-select is active)
+        batchBar = new LinearLayout(ctx);
+        batchBar.setOrientation(LinearLayout.HORIZONTAL);
+        batchBar.setGravity(Gravity.CENTER_VERTICAL);
+        batchBar.setBackgroundColor(0xFF080808);
+        batchBar.setPadding(dp(16), dp(10), dp(16), dp(12));
+        batchBar.setVisibility(View.GONE);
+
+        TextView allBtn = smallPill(ctx, "ALL", 0xFFB0B0B0, 0xFF2A2A2A);
+        allBtn.setOnClickListener(v -> {
+            List<RecordingStorage.RecordingItem> vis = getFilteredSorted();
+            if (selectedNames.size() == vis.size()) {
+                selectedNames.clear();
+            } else {
+                for (RecordingStorage.RecordingItem it : vis) selectedNames.add(it.name);
+            }
+            updateSelectionUi(ctx);
+            populateList(ctx);
+        });
+        batchBar.addView(allBtn);
+
+        View batchSpacer = new View(ctx);
+        batchBar.addView(batchSpacer, new LinearLayout.LayoutParams(0, 1, 1f));
+
+        batchShareBtn = smallPill(ctx, "SHARE (0)", 0xFF00E5A0, 0xFF00E5A0);
+        LinearLayout.LayoutParams bsLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        bsLp.rightMargin = dp(8);
+        batchShareBtn.setOnClickListener(v -> {
+            List<RecordingStorage.RecordingItem> picked = getSelectedItems();
+            if (!picked.isEmpty() && listener != null) {
+                listener.onShareMultiple(picked);
+            }
+        });
+        batchBar.addView(batchShareBtn, bsLp);
+
+        batchDeleteBtn = smallPill(ctx, "DELETE (0)", 0xFFFF2D2D, 0xFFFF2D2D);
+        batchDeleteBtn.setOnClickListener(v -> confirmBatchDelete(ctx));
+        batchBar.addView(batchDeleteBtn);
+
+        root.addView(batchBar, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
         populateList(ctx);
         return root;
     }
 
-    private void populateList(Context ctx) {
-        listContainer.removeAllViews();
+    private List<RecordingStorage.RecordingItem> getFilteredSorted() {
         List<RecordingStorage.RecordingItem> filtered = new ArrayList<>();
         for (RecordingStorage.RecordingItem item : allItems) {
             if (currentQuery.isEmpty() || item.name.toLowerCase(Locale.US).contains(currentQuery)) {
                 filtered.add(item);
             }
         }
-        headerTitle.setText("RECORDINGS (" + filtered.size() + ")");
+        Collections.sort(filtered, (a, b) -> {
+            switch (sortMode) {
+                case NAME:
+                    return a.name.compareToIgnoreCase(b.name);
+                case SIZE:
+                    return Long.compare(b.sizeBytes, a.sizeBytes);
+                case DURATION: {
+                    long da = durationCache.getOrDefault(a.name + ":" + a.sizeBytes, 0L);
+                    long db = durationCache.getOrDefault(b.name + ":" + b.sizeBytes, 0L);
+                    int cmp = Long.compare(db, da);
+                    return cmp != 0 ? cmp : Long.compare(b.sizeBytes, a.sizeBytes);
+                }
+                case NEWEST:
+                default:
+                    return Long.compare(b.lastModified, a.lastModified);
+            }
+        });
+        return filtered;
+    }
+
+    private List<RecordingStorage.RecordingItem> getSelectedItems() {
+        List<RecordingStorage.RecordingItem> out = new ArrayList<>();
+        for (RecordingStorage.RecordingItem item : allItems) {
+            if (selectedNames.contains(item.name)) out.add(item);
+        }
+        return out;
+    }
+
+    private void updateSelectionUi(Context ctx) {
+        if (selectToggleBtn != null) {
+            selectToggleBtn.setText(selectionMode ? "DONE" : "SELECT");
+            selectToggleBtn.setTextColor(selectionMode ? 0xFF00E5A0 : 0xFF9A9A9A);
+        }
+        if (batchBar != null) {
+            batchBar.setVisibility(selectionMode ? View.VISIBLE : View.GONE);
+            int n = selectedNames.size();
+            batchShareBtn.setText("SHARE (" + n + ")");
+            batchDeleteBtn.setText("DELETE (" + n + ")");
+        }
+    }
+
+    private void confirmBatchDelete(Context ctx) {
+        List<RecordingStorage.RecordingItem> picked = getSelectedItems();
+        if (picked.isEmpty()) return;
+        new AlertDialog.Builder(ctx, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setTitle("Delete " + picked.size() + " recordings?")
+                .setMessage("This permanently removes the selected files.")
+                .setPositiveButton("Delete", (d, w) -> {
+                    for (RecordingStorage.RecordingItem item : picked) {
+                        RecordingStorage.deleteRecording(ctx, item);
+                        MarkerStore.delete(ctx, item.name);
+                        WaveformCache.delete(ctx, item.name, item.sizeBytes);
+                        allItems.remove(item);
+                        if (listener != null) listener.onDeleteRecording(item);
+                    }
+                    selectedNames.clear();
+                    selectionMode = false;
+                    updateSelectionUi(ctx);
+                    populateList(ctx);
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void populateList(Context ctx) {
+        listContainer.removeAllViews();
+        List<RecordingStorage.RecordingItem> filtered = getFilteredSorted();
+        headerTitle.setText(selectionMode
+                ? ("SELECTED (" + selectedNames.size() + ")")
+                : ("RECORDINGS (" + filtered.size() + ")"));
 
         if (filtered.isEmpty()) {
             TextView empty = new TextView(ctx);
@@ -217,16 +380,27 @@ public final class RecordingsSheetDialog extends Dialog {
     }
 
     private View buildItemRow(Context ctx, RecordingStorage.RecordingItem item) {
+        boolean checked = selectionMode && selectedNames.contains(item.name);
         LinearLayout row = new LinearLayout(ctx);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
         row.setPadding(dp(12), dp(11), dp(6), dp(11));
 
         GradientDrawable bg = new GradientDrawable();
-        bg.setColor(0xFF070707);
+        bg.setColor(checked ? 0xFF0C1712 : 0xFF070707);
         bg.setCornerRadius(dp(8));
-        bg.setStroke(dp(1), 0xFF1C1C1C);
+        bg.setStroke(dp(1), checked ? 0xFF00E5A0 : 0xFF1C1C1C);
         row.setBackground(bg);
+
+        if (selectionMode) {
+            TextView chk = new TextView(ctx);
+            chk.setText(checked ? "[✓]" : "[ ]");
+            chk.setTextColor(checked ? 0xFF00E5A0 : 0xFF555555);
+            chk.setTextSize(12f);
+            chk.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
+            chk.setPadding(0, 0, dp(10), 0);
+            row.addView(chk);
+        }
 
         LinearLayout info = new LinearLayout(ctx);
         info.setOrientation(LinearLayout.VERTICAL);
@@ -262,24 +436,43 @@ public final class RecordingsSheetDialog extends Dialog {
 
         row.addView(info, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
-        ImageView renameBtn = iconBtn(ctx, R.drawable.ic_edit, "Rename");
-        renameBtn.setOnClickListener(v -> promptRename(ctx, item));
-        row.addView(renameBtn);
+        if (!selectionMode) {
+            ImageView renameBtn = iconBtn(ctx, R.drawable.ic_edit, "Rename");
+            renameBtn.setOnClickListener(v -> promptRename(ctx, item));
+            row.addView(renameBtn);
 
-        ImageView shareBtn = iconBtn(ctx, R.drawable.ic_share, "Share");
-        shareBtn.setOnClickListener(v -> {
-            if (listener != null) listener.onShareRecording(item);
-        });
-        row.addView(shareBtn);
+            ImageView shareBtn = iconBtn(ctx, R.drawable.ic_share, "Share");
+            shareBtn.setOnClickListener(v -> {
+                if (listener != null) listener.onShareRecording(item);
+            });
+            row.addView(shareBtn);
 
-        ImageView delBtn = iconBtn(ctx, R.drawable.ic_delete, "Delete");
-        delBtn.setColorFilter(0xFF994444);
-        delBtn.setOnClickListener(v -> confirmDelete(ctx, item));
-        row.addView(delBtn);
+            ImageView delBtn = iconBtn(ctx, R.drawable.ic_delete, "Delete");
+            delBtn.setColorFilter(0xFF994444);
+            delBtn.setOnClickListener(v -> confirmDelete(ctx, item));
+            row.addView(delBtn);
+        }
 
         row.setOnClickListener(v -> {
-            dismiss();
-            if (listener != null) listener.onSelectRecording(item);
+            if (selectionMode) {
+                if (!selectedNames.remove(item.name)) selectedNames.add(item.name);
+                updateSelectionUi(ctx);
+                populateList(ctx);
+            } else {
+                dismiss();
+                if (listener != null) listener.onSelectRecording(item);
+            }
+        });
+        row.setOnLongClickListener(v -> {
+            if (!selectionMode) {
+                selectionMode = true;
+                selectedNames.clear();
+                selectedNames.add(item.name);
+                updateSelectionUi(ctx);
+                populateList(ctx);
+                return true;
+            }
+            return false;
         });
 
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
@@ -365,6 +558,21 @@ public final class RecordingsSheetDialog extends Dialog {
         iv.setPadding(dp(8), dp(8), dp(8), dp(8));
         iv.setLayoutParams(new LinearLayout.LayoutParams(dp(38), dp(38)));
         return iv;
+    }
+
+    private TextView smallPill(Context ctx, String text, int fgColor, int borderColor) {
+        TextView tv = new TextView(ctx);
+        tv.setText(text);
+        tv.setTextColor(fgColor);
+        tv.setTextSize(10f);
+        tv.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
+        tv.setPadding(dp(9), dp(5), dp(9), dp(5));
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(0xFF0A0A0A);
+        bg.setCornerRadius(dp(5));
+        bg.setStroke(dp(1), borderColor);
+        tv.setBackground(bg);
+        return tv;
     }
 
     private int dp(float v) {

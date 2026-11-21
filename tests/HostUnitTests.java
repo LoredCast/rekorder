@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import com.rekorder.app.audio.AudioConfig;
+import com.rekorder.app.audio.AudioProcessor;
 import com.rekorder.app.audio.OggMuxer;
 import com.rekorder.app.audio.PcmConverter;
 import com.rekorder.app.audio.PostNormalizer;
@@ -9,6 +10,7 @@ import com.rekorder.app.audio.WaveformAnalyzer;
 import com.rekorder.app.dsp.AudioResampler;
 import com.rekorder.app.dsp.DspChain;
 import com.rekorder.app.dsp.DspConfig;
+import com.rekorder.app.storage.MarkerStore;
 
 import java.io.ByteArrayInputStream;
 import java.io.File;
@@ -59,7 +61,12 @@ public final class HostUnitTests {
         testInputGainPreampAndSoftCeiling();
         testStereoDualChannelMetering();
         testMetadataTagsOpusAndId3();
-        System.out.println("PASS: All 21 HostUnitTests passed!");
+        testDeHumNotchFilter();
+        testSoftNoiseGate();
+        testLufsMeterAndPeakCappedGain();
+        testCosineFadeAndMarkerStore();
+        testDspConfigV11SummaryAndDefaults();
+        System.out.println("PASS: All 26 HostUnitTests passed!");
     }
 
     private static void testPcmConversions() {
@@ -707,5 +714,131 @@ public final class HostUnitTests {
             check(p.waitFor() == 0 && err.isEmpty(), "ffprobe OpusTags check failed: " + err);
             check(out.contains("Studio Take") && out.contains("Rekorder"), "OpusTags metadata parsed by ffprobe: " + out);
         }
+    }
+
+    private static void testDeHumNotchFilter() {
+        int sr = 48000;
+        int n = sr; // 1.0s settle
+        DspConfig humCfg = new DspConfig("DeHum", true, 0f, 50, false, -45f,
+                false, 0, new float[]{0, 0, 0, 0, 0},
+                false, -18f, 3f, 10f, 120f, 0f, false, -1f, false);
+        DspChain chain = new DspChain(sr, 1, humCfg);
+
+        ByteBuffer humBuf = ByteBuffer.allocateDirect(n * 4).order(ByteOrder.LITTLE_ENDIAN);
+        for (int i = 0; i < n; i++) {
+            humBuf.putFloat(i << 2, (float) (0.5 * Math.sin(2.0 * Math.PI * 50.0 * i / sr)));
+        }
+        chain.processInPlace(humBuf, n);
+        // Check RMS over second half after filter settles
+        double humSq = 0.0;
+        for (int i = n / 2; i < n; i++) {
+            double s = humBuf.getFloat(i << 2);
+            humSq += s * s;
+        }
+        double humRms = Math.sqrt(humSq / (n / 2.0));
+        check(humRms < 0.02, "50Hz de-hum notch attenuates 50Hz strongly: rms=" + humRms);
+
+        chain.resetState();
+        ByteBuffer voiceBuf = ByteBuffer.allocateDirect(n * 4).order(ByteOrder.LITTLE_ENDIAN);
+        for (int i = 0; i < n; i++) {
+            voiceBuf.putFloat(i << 2, (float) (0.5 * Math.sin(2.0 * Math.PI * 1000.0 * i / sr)));
+        }
+        chain.processInPlace(voiceBuf, n);
+        double vSq = 0.0;
+        for (int i = n / 2; i < n; i++) {
+            double s = voiceBuf.getFloat(i << 2);
+            vSq += s * s;
+        }
+        double vRms = Math.sqrt(vSq / (n / 2.0));
+        checkNear(vRms, 0.5 / Math.sqrt(2.0), 0.015, "50Hz de-hum preserves 1kHz tone");
+    }
+
+    private static void testSoftNoiseGate() {
+        int sr = 48000;
+        int n = sr; // 1.0s
+        DspConfig gateCfg = new DspConfig("Gate", true, 0f, 0, true, -35f,
+                false, 0, new float[]{0, 0, 0, 0, 0},
+                false, -18f, 3f, 10f, 120f, 0f, false, -1f, false);
+        DspChain chain = new DspChain(sr, 1, gateCfg);
+
+        // Quiet floor at -55 dBFS (~0.00178 linear) should attenuate heavily
+        ByteBuffer quietBuf = ByteBuffer.allocateDirect(n * 4).order(ByteOrder.LITTLE_ENDIAN);
+        for (int i = 0; i < n; i++) {
+            quietBuf.putFloat(i << 2, (float) (0.00178 * Math.sin(2.0 * Math.PI * 400.0 * i / sr)));
+        }
+        chain.processInPlace(quietBuf, n);
+        float maxTail = 0f;
+        for (int i = n * 3 / 4; i < n; i++) {
+            maxTail = Math.max(maxTail, Math.abs(quietBuf.getFloat(i << 2)));
+        }
+        check(maxTail < 0.0002f, "Soft noise gate attenuates -55dB floor: tailPeak=" + maxTail);
+
+        // Loud voice at -12 dBFS (~0.25 linear) should open gate cleanly
+        ByteBuffer loudBuf = ByteBuffer.allocateDirect(n * 4).order(ByteOrder.LITTLE_ENDIAN);
+        for (int i = 0; i < n; i++) {
+            loudBuf.putFloat(i << 2, (float) (0.25 * Math.sin(2.0 * Math.PI * 400.0 * i / sr)));
+        }
+        chain.processInPlace(loudBuf, n);
+        float maxLoud = 0f;
+        for (int i = n / 2; i < n; i++) {
+            maxLoud = Math.max(maxLoud, Math.abs(loudBuf.getFloat(i << 2)));
+        }
+        checkNear(maxLoud, 0.25, 0.01, "Soft noise gate passes -12dB voice cleanly");
+    }
+
+    private static void testLufsMeterAndPeakCappedGain() {
+        int sr = 48000;
+        int frames = sr * 2; // 2 seconds
+        ByteBuffer buf = ByteBuffer.allocateDirect(frames * 4).order(ByteOrder.LITTLE_ENDIAN);
+        // -20 dBFS peak (0.1 linear) 1kHz sine -> RMS ~ -23 dBFS -> BS.1770 LUFS around -23.7 LUFS
+        for (int i = 0; i < frames; i++) {
+            buf.putFloat(i << 2, (float) (0.1 * Math.sin(2.0 * Math.PI * 1000.0 * i / sr)));
+        }
+        DspChain.LufsMeter meter = new DspChain.LufsMeter(sr, 1);
+        meter.feedInterleavedFloat(buf, frames);
+        float lufs = meter.getIntegratedLufs();
+        check(lufs > -26.0f && lufs < -21.0f, "BS.1770 1kHz -20dBFS sine LUFS in expected range: " + lufs);
+
+        // Target -16 LUFS with low peak -> lifts toward -16 LUFS
+        float liftGain = DspChain.computeLufsGain(lufs, -16.0f, 0.1f);
+        check(liftGain > 1.8f && liftGain < 3.0f, "LUFS lift gain reasonable: " + liftGain);
+
+        // Target -14 LUFS when peak is already 0.85 -> strictly capped at -1.0 dBFS (0.89125 / 0.85)
+        float cappedGain = DspChain.computeLufsGain(-26.0f, -14.0f, 0.85f);
+        checkNear(cappedGain * 0.85, 0.89125, 0.002, "LUFS gain capped at -1.0 dBFS true peak");
+    }
+
+    private static void testCosineFadeAndMarkerStore() {
+        int frames = 1000;
+        ByteBuffer buf = ByteBuffer.allocate(frames * 4).order(ByteOrder.LITTLE_ENDIAN);
+        for (int i = 0; i < frames; i++) buf.putFloat(i << 2, 1.0f);
+        AudioProcessor.applyCosineFade(buf, frames, 1, 0L, frames, 200L, 200L);
+        checkNear(buf.getFloat(0), 0.0, 0.001, "Cosine fade-in starts at 0");
+        checkNear(buf.getFloat(500 << 2), 1.0, 0.001, "Cosine fade middle untouched");
+        checkNear(buf.getFloat((frames - 1) << 2), 0.0, 0.001, "Cosine fade-out ends at 0");
+
+        List<MarkerStore.MarkerEntry> parsed = MarkerStore.parseEntries("15000:Chorus, 5000, 32000:Solo");
+        check(parsed.size() == 3, "Parsed 3 mixed labeled/plain markers");
+        check(parsed.get(0).timeMs == 5000L && parsed.get(0).label.isEmpty(), "Sorted marker 0");
+        check(parsed.get(1).timeMs == 15000L && "Chorus".equals(parsed.get(1).label), "Sorted marker 1");
+        String ser = MarkerStore.serializeEntries(parsed);
+        check("5000,15000:Chorus,32000:Solo".equals(ser), "Marker serialization round-trip: " + ser);
+
+        List<Long> ms = java.util.Arrays.asList(5000L, 15000L, 32000L);
+        check(MarkerStore.findNextMarker(ms, 6000L) == 15000L, "Next marker from 6s");
+        check(MarkerStore.findPrevMarker(ms, 20000L) == 15000L, "Prev marker from 20s");
+        check("podcast_1".equals(AudioConfig.sanitizePrefix("  podcast_1!@#  ")), "Filename prefix sanitizer");
+        check("rek".equals(AudioConfig.sanitizePrefix("   ")), "Blank prefix defaults to rek");
+    }
+
+    private static void testDspConfigV11SummaryAndDefaults() {
+        DspConfig cfg = new DspConfig("Podcast", true, 3.0f, 60, true, -42f,
+                true, 80, new float[]{0, 0, 1, 2, 1},
+                true, -18f, 3f, 10f, 120f, 2f,
+                true, -16f, true);
+        String sum = cfg.activeModulesSummary();
+        check(sum.contains("DEHUM 60Hz") && sum.contains("GATE -42dB") && sum.contains("-16 LUFS"),
+                "v1.1 DSP summary includes new modules: " + sum);
+        check(cfg.hasRealTimeFx() && cfg.hasNormalizer() && cfg.hasDeHum(), "v1.1 DSP flags");
     }
 }

@@ -10,7 +10,8 @@ import java.util.Locale;
 
 /**
  * Immutable configuration for Rekorder's studio DSP chain:
- * High-Pass Filter + 5-Band Equalizer + Soft-Knee Compressor + True Peak Normalizer,
+ * Preamp Gain + De-Hum Notch (50/60 Hz) + Soft Noise Gate + High-Pass Filter +
+ * 5-Band Equalizer + Soft-Knee Compressor + True Peak / LUFS Normalizer,
  * with named presets and Auto-Apply persistence.
  */
 public final class DspConfig {
@@ -21,8 +22,15 @@ public final class DspConfig {
     public final String presetName;
     public final boolean autoApply;
 
-    // Input Preamp Trim (digital gain before EQ/Compressor: [-12, +24] dB, 0 = bypass)
+    // Input Preamp Trim (digital gain before DSP: [-12, +24] dB, 0 = bypass)
     public final float inputGainDb;
+
+    // De-Hum Mains Notch (0 = off, 50 = 50/100 Hz, 60 = 60/120 Hz)
+    public final int deHumHz;
+
+    // Soft Noise Gate
+    public final boolean gateEnabled;
+    public final float gateThresholdDb; // [-60, -20]
 
     // Equalizer + HPF
     public final boolean eqEnabled;
@@ -32,23 +40,25 @@ public final class DspConfig {
     // Compressor
     public final boolean compEnabled;
     public final float compThresholdDb; // [-40, 0]
-    public final float compRatio;       // [1.5, 20]
-    public final float compAttackMs;    // [1, 100]
+    public final float compRatio;       // [1.0, 20]
+    public final float compAttackMs;    // [0.5, 100]
     public final float compReleaseMs;   // [20, 1000]
     public final float compMakeupDb;    // [0, 24]
 
-    // True Peak Normalizer (exact constant-gain pass on Stop)
+    // Normalizer (exact constant-gain pass on Stop / Export: True Peak dBFS or BS.1770 LUFS)
     public final boolean normEnabled;
-    public final float normTargetDb;    // [-6.0, -0.3]
+    public final float normTargetDb;    // Peak: [-12.0, -0.1] dBFS; LUFS: [-24.0, -10.0] LUFS
+    public final boolean normUseLufs;
 
     public DspConfig(String presetName, boolean autoApply,
                      boolean eqEnabled, int hpfHz, float[] eqBandsDb,
                      boolean compEnabled, float compThresholdDb, float compRatio,
                      float compAttackMs, float compReleaseMs, float compMakeupDb,
                      boolean normEnabled, float normTargetDb) {
-        this(presetName, autoApply, 0f, eqEnabled, hpfHz, eqBandsDb,
+        this(presetName, autoApply, 0f, 0, false, -45f,
+                eqEnabled, hpfHz, eqBandsDb,
                 compEnabled, compThresholdDb, compRatio, compAttackMs, compReleaseMs, compMakeupDb,
-                normEnabled, normTargetDb);
+                normEnabled, normTargetDb, false);
     }
 
     public DspConfig(String presetName, boolean autoApply, float inputGainDb,
@@ -56,9 +66,24 @@ public final class DspConfig {
                      boolean compEnabled, float compThresholdDb, float compRatio,
                      float compAttackMs, float compReleaseMs, float compMakeupDb,
                      boolean normEnabled, float normTargetDb) {
+        this(presetName, autoApply, inputGainDb, 0, false, -45f,
+                eqEnabled, hpfHz, eqBandsDb,
+                compEnabled, compThresholdDb, compRatio, compAttackMs, compReleaseMs, compMakeupDb,
+                normEnabled, normTargetDb, false);
+    }
+
+    public DspConfig(String presetName, boolean autoApply, float inputGainDb,
+                     int deHumHz, boolean gateEnabled, float gateThresholdDb,
+                     boolean eqEnabled, int hpfHz, float[] eqBandsDb,
+                     boolean compEnabled, float compThresholdDb, float compRatio,
+                     float compAttackMs, float compReleaseMs, float compMakeupDb,
+                     boolean normEnabled, float normTargetDb, boolean normUseLufs) {
         this.presetName = (presetName != null && !presetName.trim().isEmpty()) ? presetName.trim() : "Custom";
         this.autoApply = autoApply;
         this.inputGainDb = clamp(inputGainDb, -12f, 24f);
+        this.deHumHz = (deHumHz == 50 || deHumHz == 60) ? deHumHz : 0;
+        this.gateEnabled = gateEnabled;
+        this.gateThresholdDb = clamp(gateThresholdDb, -60f, -20f);
         this.eqEnabled = eqEnabled;
         this.hpfHz = (hpfHz == 80 || hpfHz == 120) ? hpfHz : 0;
         this.eqBandsDb = new float[5];
@@ -74,15 +99,18 @@ public final class DspConfig {
         this.compReleaseMs = clamp(compReleaseMs, 20f, 1000f);
         this.compMakeupDb = clamp(compMakeupDb, 0f, 24f);
         this.normEnabled = normEnabled;
-        this.normTargetDb = clamp(normTargetDb, -12f, -0.1f);
+        this.normUseLufs = normUseLufs;
+        this.normTargetDb = normUseLufs
+                ? clamp(normTargetDb, -24f, -10f)
+                : clamp(normTargetDb, -12f, -0.1f);
     }
 
     public static DspConfig rawBypass() {
         return new DspConfig(
-                "Raw (Bypass)", false, 0f,
+                "Raw (Bypass)", false, 0f, 0, false, -45f,
                 false, 0, new float[]{0f, 0f, 0f, 0f, 0f},
                 false, -18f, 4.0f, 10f, 120f, 4f,
-                false, -1.0f
+                false, -1.0f, false
         );
     }
 
@@ -90,8 +118,17 @@ public final class DspConfig {
         return Math.abs(inputGainDb) >= 0.05f;
     }
 
+    public boolean hasDeHum() {
+        return deHumHz == 50 || deHumHz == 60;
+    }
+
     public boolean hasRealTimeFx() {
-        return autoApply && (hasInputGain() || eqEnabled || compEnabled);
+        return autoApply && (hasInputGain() || hasDeHum() || gateEnabled || eqEnabled || compEnabled);
+    }
+
+    /** True if any real-time module is configured regardless of autoApply (used for live playback auditioning). */
+    public boolean hasAnyRealTimeModuleEnabled() {
+        return hasInputGain() || hasDeHum() || gateEnabled || eqEnabled || compEnabled;
     }
 
     public boolean hasNormalizer() {
@@ -99,19 +136,21 @@ public final class DspConfig {
     }
 
     public boolean hasAnyActiveFx() {
-        return autoApply && (hasInputGain() || eqEnabled || compEnabled || normEnabled);
+        return autoApply && (hasInputGain() || hasDeHum() || gateEnabled || eqEnabled || compEnabled || normEnabled);
     }
 
     public DspConfig withAutoApply(boolean enable) {
-        return new DspConfig(presetName, enable, inputGainDb, eqEnabled, hpfHz, eqBandsDb,
+        return new DspConfig(presetName, enable, inputGainDb, deHumHz, gateEnabled, gateThresholdDb,
+                eqEnabled, hpfHz, eqBandsDb,
                 compEnabled, compThresholdDb, compRatio, compAttackMs, compReleaseMs, compMakeupDb,
-                normEnabled, normTargetDb);
+                normEnabled, normTargetDb, normUseLufs);
     }
 
     public DspConfig withName(String name) {
-        return new DspConfig(name, autoApply, inputGainDb, eqEnabled, hpfHz, eqBandsDb,
+        return new DspConfig(name, autoApply, inputGainDb, deHumHz, gateEnabled, gateThresholdDb,
+                eqEnabled, hpfHz, eqBandsDb,
                 compEnabled, compThresholdDb, compRatio, compAttackMs, compReleaseMs, compMakeupDb,
-                normEnabled, normTargetDb);
+                normEnabled, normTargetDb, normUseLufs);
     }
 
     public String activeModulesSummary() {
@@ -119,6 +158,14 @@ public final class DspConfig {
         StringBuilder sb = new StringBuilder();
         if (hasInputGain()) {
             sb.append(String.format(Locale.US, "GAIN %+.0fdB", inputGainDb));
+        }
+        if (hasDeHum()) {
+            if (sb.length() > 0) sb.append(" · ");
+            sb.append("DEHUM ").append(deHumHz).append("Hz");
+        }
+        if (gateEnabled) {
+            if (sb.length() > 0) sb.append(" · ");
+            sb.append(String.format(Locale.US, "GATE %.0fdB", gateThresholdDb));
         }
         if (eqEnabled) {
             if (sb.length() > 0) sb.append(" · ");
@@ -131,7 +178,9 @@ public final class DspConfig {
         }
         if (normEnabled) {
             if (sb.length() > 0) sb.append(" · ");
-            sb.append(String.format(Locale.US, "NORM %.1fdB", normTargetDb));
+            sb.append(normUseLufs
+                    ? String.format(Locale.US, "%.0f LUFS", normTargetDb)
+                    : String.format(Locale.US, "NORM %.1fdB", normTargetDb));
         }
         return sb.toString();
     }
@@ -141,6 +190,9 @@ public final class DspConfig {
         o.put("name", presetName);
         o.put("autoApply", autoApply);
         o.put("inputGainDb", inputGainDb);
+        o.put("deHumHz", deHumHz);
+        o.put("gateEnabled", gateEnabled);
+        o.put("gateThresholdDb", gateThresholdDb);
         o.put("eqEnabled", eqEnabled);
         o.put("hpfHz", hpfHz);
         JSONArray bands = new JSONArray();
@@ -154,6 +206,7 @@ public final class DspConfig {
         o.put("compMakeupDb", compMakeupDb);
         o.put("normEnabled", normEnabled);
         o.put("normTargetDb", normTargetDb);
+        o.put("normUseLufs", normUseLufs);
         return o;
     }
 
@@ -166,10 +219,15 @@ public final class DspConfig {
                 bands[i] = (float) arr.optDouble(i, 0.0);
             }
         }
+        boolean useLufs = o.optBoolean("normUseLufs", false);
+        double defaultNorm = useLufs ? -16.0 : -1.0;
         return new DspConfig(
                 o.optString("name", "Custom"),
                 o.optBoolean("autoApply", true),
                 (float) o.optDouble("inputGainDb", 0.0),
+                o.optInt("deHumHz", 0),
+                o.optBoolean("gateEnabled", false),
+                (float) o.optDouble("gateThresholdDb", -45.0),
                 o.optBoolean("eqEnabled", false),
                 o.optInt("hpfHz", 0),
                 bands,
@@ -180,7 +238,8 @@ public final class DspConfig {
                 (float) o.optDouble("compReleaseMs", 120.0),
                 (float) o.optDouble("compMakeupDb", 4.0),
                 o.optBoolean("normEnabled", false),
-                (float) o.optDouble("normTargetDb", -1.0)
+                (float) o.optDouble("normTargetDb", defaultNorm),
+                useLufs
         );
     }
 

@@ -281,6 +281,10 @@ public final class WaveformView extends View {
         if (trimChangeListener != null) trimChangeListener.onTrimChanged(trimStartFrac, trimEndFrac);
     }
 
+    public float getPlayheadFraction() {
+        return playheadFraction;
+    }
+
     public void setPlayheadFraction(float fraction) {
         this.playheadFraction = Math.max(0f, Math.min(1f, fraction));
         // Auto-follow playhead when zoomed in

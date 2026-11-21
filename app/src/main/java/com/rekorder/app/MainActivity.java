@@ -9,6 +9,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.ServiceConnection;
 import android.content.pm.PackageManager;
+import android.content.res.Configuration;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.media.AudioDeviceCallback;
@@ -20,13 +21,17 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.text.InputType;
 import android.view.Gravity;
+import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.view.WindowManager;
+import android.widget.EditText;
+import android.widget.HorizontalScrollView;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.TextView;
@@ -56,6 +61,7 @@ import com.rekorder.app.ui.WaveformView;
 
 import java.io.File;
 import java.io.InputStream;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
@@ -67,6 +73,7 @@ public final class MainActivity extends Activity
 
     private static final int REQ_RECORD_AUDIO = 101;
     private static final int REQ_PICK_FOLDER = 102;
+    public static final String ACTION_QUICK_RECORD = "com.rekorder.app.ACTION_QUICK_RECORD";
 
     private static final int PENDING_NONE = 0;
     private static final int PENDING_RECORD = 1;
@@ -91,10 +98,16 @@ public final class MainActivity extends Activity
     private long previewFileBytes;
     private WavWriter.AudioFileMeta previewMeta;
     private List<Long> previewMarkers = Collections.emptyList();
+    private List<MarkerStore.MarkerEntry> previewMarkerEntries = Collections.emptyList();
     private boolean exportBusy = false;
+    private boolean livePlaybackFx = false;
+    private boolean trimLoopEnabled = false;
 
     // UI references
     private LinearLayout rootLayout;
+    private LinearLayout mainContent;
+    private LinearLayout leftPane;
+    private LinearLayout rightPane;
     private TextView statusBadge;
     private ImageView fxTopBtn;
     private TextView pathText;
@@ -109,7 +122,10 @@ public final class MainActivity extends Activity
     private TextView previewSpecText;
     private ImageView previewPlayBtn;
     private TextView speedBtn;
+    private TextView fxAuditionBtn;
     private TextView trimToggleBtn;
+    private TextView prevMarkBtn;
+    private TextView addMarkBtn;
     private TextView nextMarkBtn;
     private TextView timecodeText;
     private TextView subInfoText;
@@ -166,6 +182,7 @@ public final class MainActivity extends Activity
             playbackService = lb.getService();
             playbackBound = true;
             playbackService.setPreferredOutputDevice(config.outputDeviceId, config.outputDeviceType);
+            playbackService.setLiveDsp(livePlaybackFx, dspConfig);
             playbackService.setCallback(MainActivity.this);
             updateSpeedButtonLabel();
             syncActiveBackgroundPlayback();
@@ -196,6 +213,86 @@ public final class MainActivity extends Activity
 
         bindService(new Intent(this, RecordingService.class), serviceConn, Context.BIND_AUTO_CREATE);
         bindService(new Intent(this, PlaybackService.class), playbackConn, Context.BIND_AUTO_CREATE);
+        handleIncomingIntent(getIntent());
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleIncomingIntent(intent);
+    }
+
+    @Override
+    public void onConfigurationChanged(Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        applyOrientationLayout(newConfig);
+    }
+
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent event) {
+        if (config != null && config.volumeKeyTrigger && event.getAction() == KeyEvent.ACTION_DOWN) {
+            int code = event.getKeyCode();
+            if (code == KeyEvent.KEYCODE_VOLUME_UP) {
+                RecordingService.State st = (service != null) ? service.getState() : RecordingService.State.IDLE;
+                if (st == RecordingService.State.RECORDING || st == RecordingService.State.PAUSED) {
+                    service.togglePause();
+                } else if (st == RecordingService.State.IDLE) {
+                    onRecordButtonClicked();
+                }
+                return true;
+            } else if (code == KeyEvent.KEYCODE_VOLUME_DOWN) {
+                RecordingService.State st = (service != null) ? service.getState() : RecordingService.State.IDLE;
+                if (st == RecordingService.State.RECORDING || st == RecordingService.State.PAUSED) {
+                    long ms = service.addMarker();
+                    if (ms >= 0L) {
+                        toast("Marked " + formatTimecode(ms));
+                        refreshContextActionRow();
+                    }
+                    return true;
+                }
+            }
+        }
+        return super.dispatchKeyEvent(event);
+    }
+
+    @SuppressWarnings("deprecation")
+    private void handleIncomingIntent(Intent intent) {
+        if (intent == null) return;
+        String act = intent.getAction();
+        if (ACTION_QUICK_RECORD.equals(act)) {
+            mainHandler.post(() -> {
+                RecordingService.State st = (service != null) ? service.getState() : RecordingService.State.IDLE;
+                if (st == RecordingService.State.IDLE) {
+                    if (!hasRecordPermission()) {
+                        pendingAction = PENDING_RECORD;
+                        requestAudioAndNotifPermissions();
+                    } else if (serviceBound && service != null) {
+                        onRecordButtonClicked();
+                    } else {
+                        pendingAction = PENDING_RECORD;
+                    }
+                }
+            });
+            return;
+        }
+        Uri extUri = null;
+        if (Intent.ACTION_VIEW.equals(act)) {
+            extUri = intent.getData();
+        } else if (Intent.ACTION_SEND.equals(act)) {
+            extUri = intent.getParcelableExtra(Intent.EXTRA_STREAM);
+        }
+        if (extUri != null) {
+            RecordingStorage.RecordingItem item = RecordingStorage.fromExternalUri(this, extUri);
+            if (item != null) {
+                mainHandler.post(() -> {
+                    if (!isRecordingBusy()) {
+                        toast("Opened " + item.name);
+                        loadWaveformPreview(item.uri, item.name, item.sizeBytes, false);
+                    }
+                });
+            }
+        }
     }
 
     @Override
@@ -371,6 +468,14 @@ public final class MainActivity extends Activity
         fxLp.setMargins(dp(16), dp(2), dp(16), dp(4));
         rootLayout.addView(fxStripText, fxLp);
 
+        // 4-8. Responsive Main Content (Portrait: Vertical | Landscape: 2-Column Side-by-Side)
+        mainContent = new LinearLayout(this);
+        leftPane = new LinearLayout(this);
+        leftPane.setOrientation(LinearLayout.VERTICAL);
+        rightPane = new LinearLayout(this);
+        rightPane.setOrientation(LinearLayout.VERTICAL);
+        rightPane.setGravity(Gravity.CENTER_VERTICAL);
+
         // 4. Center Waveform Preview Stage (prominent AMOLED canvas)
         waveformView = new WaveformView(this);
         waveformView.setVisualGain(config.visualGain);
@@ -391,12 +496,15 @@ public final class MainActivity extends Activity
                 updatePreviewPlayIcon(true);
             }
         });
-        waveformView.setOnTrimChangeListener((startFrac, endFrac) -> refreshContextActionRow());
+        waveformView.setOnTrimChangeListener((startFrac, endFrac) -> {
+            syncLoopRangeIfActive();
+            refreshContextActionRow();
+        });
 
         LinearLayout.LayoutParams waveLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
         waveLp.topMargin = dp(2);
-        rootLayout.addView(waveformView, waveLp);
+        leftPane.addView(waveformView, waveLp);
 
         // 5. Studio dBFS + Compressor GR Meter (Mono or Dual Stereo L/R)
         levelMeterView = new LevelMeterView(this);
@@ -404,16 +512,16 @@ public final class MainActivity extends Activity
         LinearLayout.LayoutParams meterLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         meterLp.topMargin = dp(4);
-        rootLayout.addView(levelMeterView, meterLp);
+        leftPane.addView(levelMeterView, meterLp);
 
         // 5b. Live Processing / Loading Progress Banner (non-blocking AMOLED progress card)
         processingBanner = new ProcessingBannerView(this);
         LinearLayout.LayoutParams procLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         procLp.setMargins(dp(16), dp(6), dp(16), dp(2));
-        rootLayout.addView(processingBanner, procLp);
+        rightPane.addView(processingBanner, procLp);
 
-        // 5c. Contextual Action Strip (+MARK / DISCARD while recording/paused, EXPORT TRIM in trim mode)
+        // 5c. Contextual Action Strip (+MARK / DISCARD while recording/paused, LOOP / EXPORT TRIM in trim mode)
         contextActionRow = new LinearLayout(this);
         contextActionRow.setOrientation(LinearLayout.HORIZONTAL);
         contextActionRow.setGravity(Gravity.CENTER);
@@ -421,7 +529,7 @@ public final class MainActivity extends Activity
         LinearLayout.LayoutParams ctxLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         ctxLp.setMargins(dp(16), dp(6), dp(16), dp(2));
-        rootLayout.addView(contextActionRow, ctxLp);
+        rightPane.addView(contextActionRow, ctxLp);
 
         // 6. Preview Info & Playback Bar
         previewBar = buildPreviewBar();
@@ -429,7 +537,7 @@ public final class MainActivity extends Activity
         LinearLayout.LayoutParams prevLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         prevLp.setMargins(dp(16), dp(6), dp(16), dp(2));
-        rootLayout.addView(previewBar, prevLp);
+        rightPane.addView(previewBar, prevLp);
 
         // 7. Large Tabular Monospace Timecode + Sub-Info
         timecodeText = new TextView(this);
@@ -439,7 +547,7 @@ public final class MainActivity extends Activity
         timecodeText.setTypeface(Typeface.MONOSPACE);
         timecodeText.setGravity(Gravity.CENTER);
         timecodeText.setPadding(0, dp(8), 0, dp(2));
-        rootLayout.addView(timecodeText);
+        rightPane.addView(timecodeText);
 
         subInfoText = new TextView(this);
         subInfoText.setTextColor(0xFF666666);
@@ -447,7 +555,7 @@ public final class MainActivity extends Activity
         subInfoText.setTypeface(Typeface.MONOSPACE);
         subInfoText.setGravity(Gravity.CENTER);
         subInfoText.setPadding(dp(16), 0, dp(16), dp(12));
-        rootLayout.addView(subInfoText);
+        rightPane.addView(subInfoText);
 
         // 8. Bottom Transport Controls
         LinearLayout transport = new LinearLayout(this);
@@ -471,9 +579,32 @@ public final class MainActivity extends Activity
         rightTransportBtn.setOnClickListener(v -> onRightTransportClicked());
         transport.addView(rightTransportBtn);
 
-        rootLayout.addView(transport);
+        rightPane.addView(transport);
+
+        mainContent.addView(leftPane);
+        mainContent.addView(rightPane);
+        rootLayout.addView(mainContent, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+        applyOrientationLayout(getResources().getConfiguration());
 
         return rootLayout;
+    }
+
+    private void applyOrientationLayout(Configuration cfg) {
+        if (mainContent == null || leftPane == null || rightPane == null) return;
+        boolean land = (cfg != null && cfg.orientation == Configuration.ORIENTATION_LANDSCAPE);
+        if (land) {
+            mainContent.setOrientation(LinearLayout.HORIZONTAL);
+            leftPane.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1.3f));
+            rightPane.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1.0f));
+            if (timecodeText != null) timecodeText.setTextSize(32f);
+        } else {
+            mainContent.setOrientation(LinearLayout.VERTICAL);
+            leftPane.setLayoutParams(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+            rightPane.setLayoutParams(new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+            if (timecodeText != null) timecodeText.setTextSize(40f);
+        }
     }
 
     private LinearLayout buildPreviewBar() {
@@ -549,7 +680,9 @@ public final class MainActivity extends Activity
 
         card.addView(topRow);
 
-        // Row 2: Compact transport micro-controls (-10s | +10s | Speed | Trim | Next Marker)
+        // Row 2: Compact horizontally-scrollable transport micro-controls
+        HorizontalScrollView microScroll = new HorizontalScrollView(this);
+        microScroll.setHorizontalScrollBarEnabled(false);
         LinearLayout microRow = new LinearLayout(this);
         microRow.setOrientation(LinearLayout.HORIZONTAL);
         microRow.setGravity(Gravity.CENTER_VERTICAL);
@@ -567,16 +700,30 @@ public final class MainActivity extends Activity
         speedBtn.setOnClickListener(v -> cyclePlaybackSpeed());
         microRow.addView(speedBtn, microChipLp());
 
+        fxAuditionBtn = microChip("FX", 0xFF777777);
+        fxAuditionBtn.setOnClickListener(v -> toggleLivePlaybackFx());
+        microRow.addView(fxAuditionBtn, microChipLp());
+
         trimToggleBtn = microChip("TRIM", 0xFFFFB800);
         trimToggleBtn.setOnClickListener(v -> toggleWaveformTrimMode());
         microRow.addView(trimToggleBtn, microChipLp());
 
-        nextMarkBtn = microChip("MARK>", 0xFFFFB800);
+        prevMarkBtn = microChip("<MK", 0xFFFFB800);
+        prevMarkBtn.setVisibility(View.GONE);
+        prevMarkBtn.setOnClickListener(v -> jumpToPrevMarker());
+        microRow.addView(prevMarkBtn, microChipLp());
+
+        addMarkBtn = microChip("+MK", 0xFFFFB800);
+        addMarkBtn.setOnClickListener(v -> addOrEditPlaybackMarker());
+        microRow.addView(addMarkBtn, microChipLp());
+
+        nextMarkBtn = microChip("MK>", 0xFFFFB800);
         nextMarkBtn.setVisibility(View.GONE);
         nextMarkBtn.setOnClickListener(v -> jumpToNextMarker());
         microRow.addView(nextMarkBtn, microChipLp());
 
-        card.addView(microRow);
+        microScroll.addView(microRow);
+        card.addView(microScroll);
         return card;
     }
 
@@ -761,6 +908,9 @@ public final class MainActivity extends Activity
             if (service != null && service.getState() == RecordingService.State.MONITORING) {
                 service.updateLiveDspConfig(dspConfig);
             }
+            if (playbackService != null && livePlaybackFx) {
+                playbackService.setLiveDsp(true, dspConfig);
+            }
             refreshFxStrip();
         });
         dlg.show();
@@ -826,6 +976,11 @@ public final class MainActivity extends Activity
             @Override
             public void onShareRecording(RecordingStorage.RecordingItem item) {
                 shareUri(item.uri, item.mimeType);
+            }
+
+            @Override
+            public void onShareMultiple(List<RecordingStorage.RecordingItem> items) {
+                shareMultipleUris(items);
             }
 
             @Override
@@ -940,8 +1095,10 @@ public final class MainActivity extends Activity
             if (st == RecordingService.State.RECORDING || st == RecordingService.State.PAUSED) {
                 timecodeText.setText(formatTimecode(elapsedMs));
                 String dropStr = totalDrops > 0 ? "  ·  " + totalDrops + " XRUN" : "  ·  0 drops";
-                subInfoText.setText(RecordingStorage.formatBytes(fileBytes) + dropStr);
-                subInfoText.setTextColor(totalDrops > 0 ? 0xFFFFB800 : 0xFF7A7A7A);
+                String voxStr = (service != null && service.isVoxWaiting()) ? "  ·  VOX WAIT" : "";
+                subInfoText.setText(RecordingStorage.formatBytes(fileBytes) + dropStr + voxStr);
+                subInfoText.setTextColor(totalDrops > 0 ? 0xFFFFB800
+                        : (!voxStr.isEmpty() ? 0xFF00E5A0 : 0xFF7A7A7A));
                 AudioCaptureEngine.StreamInfo activeInfo = service.getActiveStreamInfo();
                 if (activeInfo != null) {
                     telemetryText.setText(activeInfo.telemetryLine(config, totalDrops));
@@ -1009,14 +1166,18 @@ public final class MainActivity extends Activity
         previewFileName = fileName;
         previewFileBytes = fileBytes > 0 ? fileBytes : RecordingStorage.querySize(this, uri);
         previewMeta = null;
+        previewMarkerEntries = MarkerStore.loadEntries(this, fileName);
         previewMarkers = MarkerStore.load(this, fileName);
+        trimLoopEnabled = false;
+        if (playbackService != null) playbackService.setLoopRange(0L, 0L);
 
         previewBar.setVisibility(View.VISIBLE);
         previewNameText.setText(fileName);
         previewSpecText.setText("Analyzing waveform...");
         updatePreviewPlayIcon(preservePlayback && isPlaybackPlayingForPreview());
         updateSpeedButtonLabel();
-        nextMarkBtn.setVisibility(previewMarkers.isEmpty() ? View.GONE : View.VISIBLE);
+        updateFxAuditionChip();
+        updateMarkerButtonsVisibility();
         waveformView.setTrimMode(false);
         refreshContextActionRow();
         levelMeterView.reset();
@@ -1143,31 +1304,157 @@ public final class MainActivity extends Activity
         speedBtn.setText(cur == 1.0f ? "1.0x" : String.format(Locale.US, "%.2gx", cur));
     }
 
+    private void toggleLivePlaybackFx() {
+        if (!livePlaybackFx && !dspConfig.hasAnyRealTimeModuleEnabled()) {
+            toast("Enable Preamp, Gate, De-Hum, EQ, or Comp in DSP FX first");
+            openDspSheet();
+            return;
+        }
+        livePlaybackFx = !livePlaybackFx;
+        if (playbackService != null) {
+            playbackService.setLiveDsp(livePlaybackFx, dspConfig);
+        }
+        updateFxAuditionChip();
+        toast(livePlaybackFx ? "Live playback FX ON (" + dspConfig.presetName + ")" : "Live playback FX bypassed (raw)");
+    }
+
+    private void updateFxAuditionChip() {
+        if (fxAuditionBtn == null) return;
+        fxAuditionBtn.setText(livePlaybackFx ? "FX ON" : "FX");
+        fxAuditionBtn.setTextColor(livePlaybackFx ? 0xFF00E5A0 : 0xFF777777);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(livePlaybackFx ? 0xFF0A1612 : 0xFF0E0E0E);
+        bg.setCornerRadius(dp(5));
+        bg.setStroke(dp(1), livePlaybackFx ? 0xFF00E5A0 : 0xFF222222);
+        fxAuditionBtn.setBackground(bg);
+    }
+
+    private void updateMarkerButtonsVisibility() {
+        int vis = previewMarkers.isEmpty() ? View.GONE : View.VISIBLE;
+        if (prevMarkBtn != null) prevMarkBtn.setVisibility(vis);
+        if (nextMarkBtn != null) nextMarkBtn.setVisibility(vis);
+    }
+
+    private void syncWaveformMarkers() {
+        if (previewMeta == null) return;
+        waveformView.setMarkers(previewMarkers, previewMeta.durationMs());
+        updateMarkerButtonsVisibility();
+    }
+
+    private void jumpToPrevMarker() {
+        if (previewMeta == null || previewUri == null || previewMarkers.isEmpty() || playbackService == null) return;
+        long curPos = isPlaybackActiveForPreview()
+                ? playbackService.getCurrentPositionMs()
+                : (long) (waveformView.getPlayheadFraction() * previewMeta.durationMs());
+        long target = MarkerStore.findPrevMarker(previewMarkers, curPos);
+        if (target < 0L) target = previewMarkers.get(previewMarkers.size() - 1);
+        seekOrPlayPreviewAt(target);
+        toast("Marker · " + formatMarkerToast(target));
+    }
+
     private void jumpToNextMarker() {
         if (previewMeta == null || previewUri == null || previewMarkers.isEmpty() || playbackService == null) return;
-        long curPos = isPlaybackActiveForPreview() ? playbackService.getCurrentPositionMs() : -1L;
-        long target = previewMarkers.get(0);
-        for (Long m : previewMarkers) {
-            if (m > curPos + 250L) {
-                target = m;
-                break;
-            }
-        }
+        long curPos = isPlaybackActiveForPreview()
+                ? playbackService.getCurrentPositionMs()
+                : (long) (waveformView.getPlayheadFraction() * previewMeta.durationMs());
+        long target = MarkerStore.findNextMarker(previewMarkers, curPos);
+        if (target < 0L) target = previewMarkers.get(0);
+        seekOrPlayPreviewAt(target);
+        toast("Marker · " + formatMarkerToast(target));
+    }
+
+    private void seekOrPlayPreviewAt(long targetMs) {
         if (isPlaybackActiveForPreview()) {
-            playbackService.seekToMs(target);
-        } else {
-            playbackService.playTrack(previewUri, previewFileName, previewFileBytes, previewMeta, target);
+            playbackService.seekToMs(targetMs);
+        } else if (playbackService != null) {
+            playbackService.playTrack(previewUri, previewFileName, previewFileBytes, previewMeta, targetMs);
             updatePreviewPlayIcon(true);
         }
-        toast("Marker · " + formatTimecode(target));
+        if (previewMeta != null && previewMeta.durationMs() > 0) {
+            waveformView.setPlayheadFraction((float) targetMs / (float) previewMeta.durationMs());
+            timecodeText.setText(formatTimecode(targetMs));
+        }
+    }
+
+    private String formatMarkerToast(long ms) {
+        for (MarkerStore.MarkerEntry e : previewMarkerEntries) {
+            if (Math.abs(e.timeMs - ms) < 5L && !e.label.isEmpty()) {
+                return e.label + " (" + formatTimecode(ms) + ")";
+            }
+        }
+        return formatTimecode(ms);
+    }
+
+    private void addOrEditPlaybackMarker() {
+        if (previewMeta == null || previewFileName == null) return;
+        long posMs = isPlaybackActiveForPreview()
+                ? playbackService.getCurrentPositionMs()
+                : (long) (waveformView.getPlayheadFraction() * previewMeta.durationMs());
+        int nearIdx = MarkerStore.findNearestIndex(previewMarkerEntries, posMs, 1000L);
+        if (nearIdx >= 0) {
+            final MarkerStore.MarkerEntry existing = previewMarkerEntries.get(nearIdx);
+            EditText input = new EditText(this);
+            input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES);
+            input.setHint("Marker label (optional)");
+            input.setText(existing.label);
+            input.setSelection(existing.label.length());
+            input.setTextColor(0xFFF2F2F2);
+            input.setHintTextColor(0xFF666666);
+            LinearLayout wrap = new LinearLayout(this);
+            wrap.setPadding(dp(18), dp(10), dp(18), dp(4));
+            wrap.addView(input, new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+            new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                    .setTitle("Marker @ " + formatTimecode(existing.timeMs))
+                    .setView(wrap)
+                    .setPositiveButton("Save Label", (d, w) -> {
+                        List<MarkerStore.MarkerEntry> updated = new ArrayList<>(previewMarkerEntries);
+                        updated.set(nearIdx, new MarkerStore.MarkerEntry(existing.timeMs, input.getText().toString()));
+                        MarkerStore.saveEntries(this, previewFileName, updated);
+                        previewMarkerEntries = updated;
+                        previewMarkers = MarkerStore.load(this, previewFileName);
+                        syncWaveformMarkers();
+                    })
+                    .setNeutralButton("Delete", (d, w) -> {
+                        List<MarkerStore.MarkerEntry> updated = new ArrayList<>(previewMarkerEntries);
+                        updated.remove(nearIdx);
+                        MarkerStore.saveEntries(this, previewFileName, updated);
+                        previewMarkerEntries = updated;
+                        previewMarkers = MarkerStore.load(this, previewFileName);
+                        syncWaveformMarkers();
+                        toast("Marker removed");
+                    })
+                    .setNegativeButton("Cancel", null)
+                    .show();
+        } else {
+            previewMarkerEntries = MarkerStore.addMarker(this, previewFileName, posMs, "");
+            previewMarkers = MarkerStore.load(this, previewFileName);
+            syncWaveformMarkers();
+            toast("Marked " + formatTimecode(posMs) + " (tap +MK again here to name/delete)");
+        }
+    }
+
+    private void syncLoopRangeIfActive() {
+        if (playbackService == null) return;
+        if (trimLoopEnabled && previewMeta != null && waveformView.isTrimMode()) {
+            long dur = previewMeta.durationMs();
+            long sMs = (long) (waveformView.getTrimStartFraction() * dur);
+            long eMs = (long) (waveformView.getTrimEndFraction() * dur);
+            playbackService.setLoopRange(sMs, eMs);
+        } else {
+            playbackService.setLoopRange(0L, 0L);
+        }
     }
 
     private void toggleWaveformTrimMode() {
         if (previewMeta == null) return;
         boolean next = !waveformView.isTrimMode();
         waveformView.setTrimMode(next);
-        if (next) {
-            toast("Drag amber handles on waveform to set trim range");
+        if (!next) {
+            trimLoopEnabled = false;
+            syncLoopRangeIfActive();
+        } else {
+            toast("Drag amber handles on waveform to set trim/loop range");
         }
         refreshContextActionRow();
     }
@@ -1183,7 +1470,7 @@ public final class MainActivity extends Activity
         long endMs = waveformView.isTrimMode() ? (long) (waveformView.getTrimEndFraction() * dur) : dur;
 
         EditExportDialog dlg = new EditExportDialog(
-                this, previewFileName, dur, startMs, endMs, dspConfig, config,
+                this, previewFileName, dur, startMs, endMs, previewMarkers.size(), dspConfig, config,
                 new EditExportDialog.Listener() {
                     @Override
                     public void onToggleWaveformTrim() {
@@ -1193,19 +1480,28 @@ public final class MainActivity extends Activity
                     }
 
                     @Override
-                    public void onExportRequested(long tStart, long tEnd, DspConfig dspToApply,
+                    public void onExportRequested(long tStart, long tEnd, boolean cutMiddle,
+                                                  int fadeInMs, int fadeOutMs, DspConfig dspToApply,
                                                   AudioConfig.OutputFormat outFmt, int kbps) {
-                        runOfflineExport(tStart, tEnd, dspToApply, outFmt, kbps);
+                        runOfflineExport(tStart, tEnd, cutMiddle, fadeInMs, fadeOutMs, dspToApply, outFmt, kbps);
+                    }
+
+                    @Override
+                    public void onSplitAtMarkersRequested(int fadeInMs, int fadeOutMs, DspConfig dspToApply,
+                                                          AudioConfig.OutputFormat outFmt, int kbps) {
+                        runSplitAtMarkers(fadeInMs, fadeOutMs, dspToApply, outFmt, kbps);
                     }
                 });
         dlg.show();
     }
 
-    private void runOfflineExport(long startMs, long endMs, DspConfig dspToApply,
+    private void runOfflineExport(long startMs, long endMs, boolean cutMiddle,
+                                  int fadeInMs, int fadeOutMs, DspConfig dspToApply,
                                   AudioConfig.OutputFormat outFmt, int kbps) {
         if (previewUri == null || previewMeta == null || exportBusy) return;
         stopBackgroundPlayback();
         exportBusy = true;
+        trimLoopEnabled = false;
         waveformView.setTrimMode(false);
         refreshContextActionRow();
 
@@ -1222,7 +1518,8 @@ public final class MainActivity extends Activity
             try {
                 AudioProcessor.ProcessResult res = AudioProcessor.processFile(
                         this, srcUri, srcName, srcMeta,
-                        startMs, endMs, dspToApply, outFmt, kbps,
+                        startMs, endMs, cutMiddle, fadeInMs, fadeOutMs, null,
+                        dspToApply, outFmt, kbps,
                         (done, total, pct) -> mainHandler.post(() -> {
                             statusBadge.setText("PROC " + pct + "%");
                             processingBanner.showProgress(stage, srcName + " -> " + outFmt.shortLabel, pct, 0xFFFFB800);
@@ -1242,6 +1539,71 @@ public final class MainActivity extends Activity
                 });
             }
         });
+    }
+
+    private void runSplitAtMarkers(int fadeInMs, int fadeOutMs, DspConfig dspToApply,
+                                   AudioConfig.OutputFormat outFmt, int kbps) {
+        if (previewUri == null || previewMeta == null || exportBusy) return;
+        stopBackgroundPlayback();
+        exportBusy = true;
+        trimLoopEnabled = false;
+        waveformView.setTrimMode(false);
+        refreshContextActionRow();
+
+        final Uri srcUri = previewUri;
+        final String srcName = previewFileName;
+        final WavWriter.AudioFileMeta srcMeta = previewMeta;
+        final List<MarkerStore.MarkerEntry> markers = new ArrayList<>(previewMarkerEntries);
+        final String stage = "SPLITTING INTO CHAPTERS (" + outFmt.shortLabel + ")";
+
+        styleBadge(0xFFFFB800, 0xFFFFB800);
+        statusBadge.setText("SPLIT");
+        processingBanner.showProgress(stage, "Splitting at " + markers.size() + " marker(s)...", 0, 0xFFFFB800);
+
+        ioExecutor.execute(() -> {
+            try {
+                List<AudioProcessor.ProcessResult> parts = AudioProcessor.splitAtMarkers(
+                        this, srcUri, srcName, srcMeta, markers,
+                        fadeInMs, fadeOutMs, dspToApply, outFmt, kbps,
+                        (done, total, pct) -> mainHandler.post(() -> {
+                            statusBadge.setText("SPLIT " + pct + "%");
+                            processingBanner.showProgress(stage,
+                                    "Part " + done + " / " + total + " -> " + outFmt.shortLabel, pct, 0xFFFFB800);
+                        }));
+                mainHandler.post(() -> {
+                    exportBusy = false;
+                    processingBanner.hide();
+                    statusBadge.setText("PREVIEW");
+                    toast("Exported " + parts.size() + " split chapter files");
+                });
+            } catch (Exception e) {
+                mainHandler.post(() -> {
+                    exportBusy = false;
+                    processingBanner.hide();
+                    statusBadge.setText("PREVIEW");
+                    toast("Split failed: " + e.getMessage());
+                });
+            }
+        });
+    }
+
+    private void shareMultipleUris(List<RecordingStorage.RecordingItem> items) {
+        if (items == null || items.isEmpty()) return;
+        if (items.size() == 1) {
+            shareUri(items.get(0).uri, items.get(0).mimeType);
+            return;
+        }
+        ArrayList<Uri> uris = new ArrayList<>(items.size());
+        for (RecordingStorage.RecordingItem it : items) uris.add(it.uri);
+        Intent share = new Intent(Intent.ACTION_SEND_MULTIPLE);
+        share.setType("audio/*");
+        share.putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris);
+        share.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        try {
+            startActivity(Intent.createChooser(share, "Share " + items.size() + " Recordings"));
+        } catch (Exception e) {
+            toast("No share target available");
+        }
     }
 
     private void refreshContextActionRow() {
@@ -1278,24 +1640,46 @@ public final class MainActivity extends Activity
             long sMs = (long) (waveformView.getTrimStartFraction() * dur);
             long eMs = (long) (waveformView.getTrimEndFraction() * dur);
             TextView rangeTv = new TextView(this);
-            rangeTv.setText(formatTimecode(sMs) + " - " + formatTimecode(eMs));
+            rangeTv.setText(formatTimecode(sMs) + "-" + formatTimecode(eMs));
             rangeTv.setTextColor(0xFFFFB800);
-            rangeTv.setTextSize(10.5f);
+            rangeTv.setTextSize(10f);
             rangeTv.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
             contextActionRow.addView(rangeTv);
 
-            TextView exportBtn = actionPill("EXPORT TRIM", 0xFF00E5A0);
+            TextView loopBtn = actionPill(trimLoopEnabled ? "LOOP ON" : "LOOP",
+                    trimLoopEnabled ? 0xFF00E5A0 : 0xFF888888);
+            LinearLayout.LayoutParams llp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            llp.leftMargin = dp(8);
+            loopBtn.setOnClickListener(v -> {
+                trimLoopEnabled = !trimLoopEnabled;
+                syncLoopRangeIfActive();
+                if (trimLoopEnabled && playbackService != null) {
+                    if (isPlaybackActiveForPreview()) {
+                        playbackService.seekToMs(sMs);
+                    } else {
+                        playbackService.playTrack(previewUri, previewFileName, previewFileBytes, previewMeta, sMs);
+                        updatePreviewPlayIcon(true);
+                    }
+                }
+                refreshContextActionRow();
+            });
+            contextActionRow.addView(loopBtn, llp);
+
+            TextView exportBtn = actionPill("EXPORT", 0xFF00E5A0);
             LinearLayout.LayoutParams elp = new LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-            elp.leftMargin = dp(10);
+            elp.leftMargin = dp(8);
             exportBtn.setOnClickListener(v -> openEditExportDialog());
             contextActionRow.addView(exportBtn, elp);
 
-            TextView cancelBtn = actionPill("CANCEL", 0xFF777777);
+            TextView cancelBtn = actionPill("×", 0xFF777777);
             LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
             clp.leftMargin = dp(8);
             cancelBtn.setOnClickListener(v -> {
+                trimLoopEnabled = false;
+                syncLoopRangeIfActive();
                 waveformView.setTrimMode(false);
                 refreshContextActionRow();
             });
@@ -1346,6 +1730,9 @@ public final class MainActivity extends Activity
         previewFileName = null;
         previewMeta = null;
         previewMarkers = Collections.emptyList();
+        previewMarkerEntries = Collections.emptyList();
+        trimLoopEnabled = false;
+        if (playbackService != null) playbackService.setLoopRange(0L, 0L);
         waveformView.setTrimMode(false);
         previewBar.setVisibility(View.GONE);
         refreshContextActionRow();

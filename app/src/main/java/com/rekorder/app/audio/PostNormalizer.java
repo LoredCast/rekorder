@@ -48,6 +48,15 @@ public final class PostNormalizer {
                                             ProgressListener progress) throws IOException {
         if (dataBytes <= 0L || maxPeakLinear <= 1e-6f || !Float.isFinite(maxPeakLinear)) return 0f;
         float gain = DspChain.computeNormalizeGain(maxPeakLinear, targetDb);
+        return normalizePcmInPlaceByGain(readChannel, writeChannel, fmt, dataOffset, dataBytes, gain, progress);
+    }
+
+    /** Applies an explicit linear gain factor in-place on a WAV or RAW PCM FileChannel (Peak or LUFS). */
+    public static float normalizePcmInPlaceByGain(FileChannel readChannel, FileChannel writeChannel,
+                                                  AudioConfig.OutputFormat fmt,
+                                                  long dataOffset, long dataBytes,
+                                                  float gain, ProgressListener progress) throws IOException {
+        if (dataBytes <= 0L || !Float.isFinite(gain) || gain <= 0f) return 0f;
         if (Math.abs(gain - 1.0f) < 0.01f) return 0f;
 
         int bps = fmt.bytesPerSample;
@@ -161,8 +170,17 @@ public final class PostNormalizer {
             int sampleRate, int channels, int bitrateKbps,
             float maxPeakLinear, float targetDb, ProgressListener progress) throws IOException {
 
-        float gain = DspChain.computeNormalizeGain(maxPeakLinear, targetDb);
-        if (maxPeakLinear <= 1e-6f) gain = 1.0f;
+        float gain = (maxPeakLinear > 1e-6f) ? DspChain.computeNormalizeGain(maxPeakLinear, targetDb) : 1.0f;
+        return normalizeAndEncodeCompressedByGain(scratchFile, targetChannel, format,
+                sampleRate, channels, bitrateKbps, gain, progress);
+    }
+
+    public static float normalizeAndEncodeCompressedByGain(
+            File scratchFile, FileChannel targetChannel, AudioConfig.OutputFormat format,
+            int sampleRate, int channels, int bitrateKbps,
+            float gain, ProgressListener progress) throws IOException {
+
+        if (!Float.isFinite(gain) || gain <= 0f) gain = 1.0f;
 
         int bpf = channels * 4;
         int chunkFrames = 4096;

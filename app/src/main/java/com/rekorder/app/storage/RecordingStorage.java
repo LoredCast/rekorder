@@ -209,28 +209,84 @@ public final class RecordingStorage {
     }
 
     public static String buildFileName(AudioConfig.OutputFormat fmt, int sampleRate, int channels) {
-        return buildFileName(fmt, sampleRate, channels, "");
+        return buildFileName("rek", fmt, sampleRate, channels, "");
     }
 
     public static String buildFileName(AudioConfig.OutputFormat fmt, int sampleRate, int channels, String suffix) {
+        return buildFileName("rek", fmt, sampleRate, channels, suffix);
+    }
+
+    public static String buildFileName(String prefix, AudioConfig.OutputFormat fmt,
+                                       int sampleRate, int channels, String suffix) {
+        String pfx = AudioConfig.sanitizePrefix(prefix);
         String ts = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
         String sfx = (suffix != null) ? suffix : "";
         if (fmt.hasWavHeader || fmt.isCompressed) {
-            return "rek_" + ts + sfx + "." + fmt.extension;
+            return pfx + "_" + ts + sfx + "." + fmt.extension;
         }
-        return "rek_" + ts + sfx + "_" + sampleRate + "Hz_" + fmt.rawTag() + "_" + channels + "ch.pcm";
+        return pfx + "_" + ts + sfx + "_" + sampleRate + "Hz_" + fmt.rawTag() + "_" + channels + "ch.pcm";
     }
 
     public static RecordingTarget createTarget(Context ctx, AudioConfig.OutputFormat fmt,
                                                int sampleRate, int channels) throws IOException {
-        return createTarget(ctx, fmt, sampleRate, channels, "", false);
+        return createTarget(ctx, "rek", fmt, sampleRate, channels, "", false);
     }
 
     public static RecordingTarget createTarget(Context ctx, AudioConfig.OutputFormat fmt,
                                                int sampleRate, int channels, String suffix,
                                                boolean forceLocalDefault) throws IOException {
-        String name = buildFileName(fmt, sampleRate, channels, suffix);
+        return createTarget(ctx, "rek", fmt, sampleRate, channels, suffix, forceLocalDefault);
+    }
+
+    public static RecordingTarget createTarget(Context ctx, String prefix, AudioConfig.OutputFormat fmt,
+                                               int sampleRate, int channels, String suffix,
+                                               boolean forceLocalDefault) throws IOException {
+        String name = buildFileName(prefix, fmt, sampleRate, channels, suffix);
         return createNamedTarget(ctx, name, forceLocalDefault);
+    }
+
+    /** Wraps an external ACTION_VIEW / ACTION_SEND content:// or file:// audio URI as a RecordingItem. */
+    public static RecordingItem fromExternalUri(Context ctx, Uri uri) {
+        if (ctx == null || uri == null) return null;
+        String name = null;
+        long size = 0L;
+        String mime = null;
+        File local = null;
+        if ("file".equalsIgnoreCase(uri.getScheme()) && uri.getPath() != null) {
+            local = new File(uri.getPath());
+            name = local.getName();
+            size = local.length();
+            mime = guessMime(name);
+        } else {
+            ContentResolver cr = ctx.getContentResolver();
+            try { mime = cr.getType(uri); } catch (Exception ignored) {}
+            try (Cursor c = cr.query(uri, new String[]{OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE},
+                    null, null, null)) {
+                if (c != null && c.moveToFirst()) {
+                    int nIdx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                    int sIdx = c.getColumnIndex(OpenableColumns.SIZE);
+                    if (nIdx >= 0) name = c.getString(nIdx);
+                    if (sIdx >= 0 && !c.isNull(sIdx)) size = c.getLong(sIdx);
+                }
+            } catch (Exception ignored) {
+            }
+            if (name == null || name.isEmpty()) {
+                String seg = uri.getLastPathSegment();
+                if (seg != null) {
+                    int slash = seg.lastIndexOf('/');
+                    name = (slash >= 0) ? seg.substring(slash + 1) : seg;
+                }
+            }
+            if (name == null || name.isEmpty()) name = "imported_audio.wav";
+            if (!name.contains(".") && mime != null) {
+                if (mime.contains("mpeg") || mime.contains("mp3")) name += ".mp3";
+                else if (mime.contains("ogg") || mime.contains("opus")) name += ".ogg";
+                else if (mime.contains("flac")) name += ".flac";
+                else name += ".wav";
+            }
+            if (mime == null || mime.isEmpty()) mime = guessMime(name);
+        }
+        return new RecordingItem(uri, name, size, System.currentTimeMillis(), mime, local == null, local);
     }
 
     /**

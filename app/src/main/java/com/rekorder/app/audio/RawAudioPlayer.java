@@ -14,6 +14,8 @@ import android.net.Uri;
 import android.os.ParcelFileDescriptor;
 
 import com.rekorder.app.dsp.AudioResampler;
+import com.rekorder.app.dsp.DspChain;
+import com.rekorder.app.dsp.DspConfig;
 
 import java.io.FileInputStream;
 import java.io.IOException;
@@ -55,6 +57,11 @@ public final class RawAudioPlayer {
     private volatile int preferredOutputDeviceType = 0;
     private volatile long currentPosMs = 0L;
     private volatile long totalDurMs = 0L;
+    private volatile boolean liveDspEnabled = false;
+    private volatile DspConfig liveDspConfig = DspConfig.rawBypass();
+    private volatile DspChain activeDspChain = null;
+    private volatile long loopStartMs = 0L;
+    private volatile long loopEndMs = 0L;
 
     public RawAudioPlayer(Context context, Listener listener) {
         this.context = context.getApplicationContext();
@@ -124,6 +131,35 @@ public final class RawAudioPlayer {
         this.preferredOutputDeviceId = Math.max(0, deviceId);
         this.preferredOutputDeviceType = Math.max(0, deviceType);
         applyPreferredOutputDevice(activeTrack);
+    }
+
+    /** Enables/updates real-time DSP auditioning during playback without restarting AudioTrack. */
+    public void setLiveDsp(boolean enabled, DspConfig cfg) {
+        this.liveDspEnabled = enabled;
+        this.liveDspConfig = (cfg != null) ? cfg : DspConfig.rawBypass();
+        DspChain chain = activeDspChain;
+        if (chain != null) {
+            chain.reconfigure(enabled ? this.liveDspConfig.withAutoApply(true) : DspConfig.rawBypass());
+        }
+    }
+
+    public boolean isLiveDspEnabled() {
+        return liveDspEnabled;
+    }
+
+    /** Sets A-B loop range in milliseconds (pass 0, 0 to disable looping). */
+    public void setLoopRange(long startMs, long endMs) {
+        if (endMs > startMs + 100L) {
+            this.loopStartMs = Math.max(0L, startMs);
+            this.loopEndMs = endMs;
+        } else {
+            this.loopStartMs = 0L;
+            this.loopEndMs = 0L;
+        }
+    }
+
+    public boolean isLoopActive() {
+        return loopEndMs > loopStartMs + 100L;
     }
 
     private void applyPreferredOutputDevice(AudioTrack t) {
@@ -317,6 +353,9 @@ public final class RawAudioPlayer {
             AudioResampler resampler = (ot.outputRate != meta.sampleRate)
                     ? new AudioResampler(meta.sampleRate, ot.outputRate, meta.channels)
                     : null;
+            DspChain dspChain = new DspChain(meta.sampleRate, meta.channels,
+                    liveDspEnabled ? liveDspConfig.withAutoApply(true) : DspConfig.rawBypass());
+            activeDspChain = dspChain;
 
             pfd = context.getContentResolver().openFileDescriptor(uri, "r");
             if (pfd == null) throw new IOException("Cannot open file for playback");
@@ -367,7 +406,26 @@ public final class RawAudioPlayer {
                 }
 
                 long remFrames = totalFrames - framePos;
+                long lStart = loopStartMs;
+                long lEnd = loopEndMs;
+                boolean looping = (lEnd > lStart + 100L);
+                if (looping) {
+                    long loopEndFrame = Math.min(totalFrames, (lEnd * meta.sampleRate) / 1000L);
+                    if (framePos >= loopEndFrame) {
+                        framePos = Math.min(totalFrames, (lStart * meta.sampleRate) / 1000L);
+                        fc.position(meta.dataOffset + framePos * bpf);
+                        dspChain.resetState();
+                        continue;
+                    }
+                    remFrames = Math.min(remFrames, loopEndFrame - framePos);
+                }
                 if (remFrames <= 0) {
+                    if (looping) {
+                        framePos = Math.min(totalFrames, (lStart * meta.sampleRate) / 1000L);
+                        fc.position(meta.dataOffset + framePos * bpf);
+                        dspChain.resetState();
+                        continue;
+                    }
                     // Let remaining AudioTrack hardware buffer play out cleanly (~120ms)
                     try { Thread.sleep(120); } catch (InterruptedException ignored) {}
                     running.set(false);
@@ -401,6 +459,9 @@ public final class RawAudioPlayer {
 
                 int floatBytes = PcmConverter.convertToOutput(
                         srcBuf, actualFrames * bpf, meta.pcmFormat, AudioConfig.OutputFormat.WAV_32F, floatBuf);
+                if (liveDspEnabled) {
+                    dspChain.processInPlace(floatBuf, actualFrames);
+                }
                 ByteBuffer playFloat = floatBuf;
                 int playFloatBytes = floatBytes;
 
@@ -443,6 +504,7 @@ public final class RawAudioPlayer {
         } finally {
             running.set(false);
             activeTrack = null;
+            activeDspChain = null;
             if (track != null) {
                 try { track.stop(); } catch (IllegalStateException ignored) {}
                 track.release();
@@ -487,6 +549,9 @@ public final class RawAudioPlayer {
             OpenedTrack ot = openAudioTrackWithFallback(sampleRate, channels, false);
             track = ot.track;
             activeTrack = track;
+            DspChain dspChain = new DspChain(sampleRate, channels,
+                    liveDspEnabled ? liveDspConfig.withAutoApply(true) : DspConfig.rawBypass());
+            activeDspChain = dspChain;
 
             codec = MediaCodec.createDecoderByType(mime);
             codec.configure(format, null, null, 0);
@@ -499,6 +564,9 @@ public final class RawAudioPlayer {
 
             MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
             byte[] pcmScratch = new byte[16384];
+            ByteBuffer dspSrcBuf = ByteBuffer.allocate(16384).order(ByteOrder.LITTLE_ENDIAN);
+            ByteBuffer dspFloatBuf = ByteBuffer.allocate(32768).order(ByteOrder.LITTLE_ENDIAN);
+            ByteBuffer dspOutBuf = ByteBuffer.allocate(16384).order(ByteOrder.LITTLE_ENDIAN);
             boolean inputDone = false;
             long currentMs = initialMs;
             long totalMs = Math.max(meta.durationMs(),
@@ -564,6 +632,9 @@ public final class RawAudioPlayer {
                         OpenedTrack rebuilt = openAudioTrackWithFallback(sampleRate, channels, false);
                         track = rebuilt.track;
                         activeTrack = track;
+                        dspChain = new DspChain(sampleRate, channels,
+                                liveDspEnabled ? liveDspConfig.withAutoApply(true) : DspConfig.rawBypass());
+                        activeDspChain = dspChain;
                         if (!paused.get()) track.play();
                     }
                 } else if (outIdx >= 0) {
@@ -575,7 +646,27 @@ public final class RawAudioPlayer {
                         outBuf.limit(info.offset + info.size);
                         outBuf.position(info.offset);
                         outBuf.get(pcmScratch, 0, info.size);
-                        track.write(pcmScratch, 0, info.size, AudioTrack.WRITE_BLOCKING);
+                        if (liveDspEnabled) {
+                            int frames = info.size / Math.max(1, channels * 2);
+                            if (dspSrcBuf.capacity() < info.size) {
+                                dspSrcBuf = ByteBuffer.allocate(info.size).order(ByteOrder.LITTLE_ENDIAN);
+                                dspFloatBuf = ByteBuffer.allocate(info.size * 2).order(ByteOrder.LITTLE_ENDIAN);
+                                dspOutBuf = ByteBuffer.allocate(info.size).order(ByteOrder.LITTLE_ENDIAN);
+                            }
+                            dspSrcBuf.clear();
+                            dspSrcBuf.put(pcmScratch, 0, info.size);
+                            dspSrcBuf.flip();
+                            int fBytes = PcmConverter.convertToOutput(dspSrcBuf, info.size,
+                                    PcmConverter.FMT_PCM_I16, AudioConfig.OutputFormat.WAV_32F, dspFloatBuf);
+                            dspChain.processInPlace(dspFloatBuf, frames);
+                            int outBytes = PcmConverter.convertToOutput(dspFloatBuf, fBytes,
+                                    PcmConverter.FMT_PCM_FLOAT, AudioConfig.OutputFormat.WAV_16, dspOutBuf);
+                            dspOutBuf.position(0);
+                            dspOutBuf.get(pcmScratch, 0, Math.min(outBytes, pcmScratch.length));
+                            track.write(pcmScratch, 0, outBytes, AudioTrack.WRITE_BLOCKING);
+                        } else {
+                            track.write(pcmScratch, 0, info.size, AudioTrack.WRITE_BLOCKING);
+                        }
 
                         if (info.presentationTimeUs >= 0) {
                             currentMs = info.presentationTimeUs / 1000L;
@@ -584,6 +675,20 @@ public final class RawAudioPlayer {
                             currentMs += (frames * 1000L) / Math.max(1, sampleRate);
                         }
                         currentPosMs = Math.min(currentMs, totalMs > 0 ? totalMs : currentMs);
+
+                        long lStart = loopStartMs;
+                        long lEnd = loopEndMs;
+                        if (lEnd > lStart + 100L && currentPosMs >= lEnd) {
+                            codec.releaseOutputBuffer(outIdx, false);
+                            extractor.seekTo(lStart * 1000L, MediaExtractor.SEEK_TO_PREVIOUS_SYNC);
+                            codec.flush();
+                            dspChain.resetState();
+                            inputDone = false;
+                            currentMs = lStart;
+                            currentPosMs = lStart;
+                            continue;
+                        }
+
                         long now = System.currentTimeMillis();
                         Listener l = listener;
                         if (l != null && now - lastNotify >= 40) {
@@ -593,6 +698,17 @@ public final class RawAudioPlayer {
                     }
                     codec.releaseOutputBuffer(outIdx, false);
                     if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
+                        long lStart = loopStartMs;
+                        long lEnd = loopEndMs;
+                        if (lEnd > lStart + 100L) {
+                            extractor.seekTo(lStart * 1000L, MediaExtractor.SEEK_TO_PREVIOUS_SYNC);
+                            codec.flush();
+                            dspChain.resetState();
+                            inputDone = false;
+                            currentMs = lStart;
+                            currentPosMs = lStart;
+                            continue;
+                        }
                         try { Thread.sleep(120); } catch (InterruptedException ignored) {}
                         running.set(false);
                         currentPosMs = totalMs;
@@ -613,6 +729,7 @@ public final class RawAudioPlayer {
         } finally {
             running.set(false);
             activeTrack = null;
+            activeDspChain = null;
             if (track != null) {
                 try { track.stop(); } catch (IllegalStateException ignored) {}
                 track.release();

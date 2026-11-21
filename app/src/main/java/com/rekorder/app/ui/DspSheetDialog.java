@@ -3,6 +3,8 @@ package com.rekorder.app.ui;
 
 import android.app.AlertDialog;
 import android.app.Dialog;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.res.ColorStateList;
 import android.graphics.Typeface;
@@ -45,11 +47,16 @@ public final class DspSheetDialog extends Dialog {
     }
 
     private static final float[] NORM_TARGETS = {-0.5f, -1.0f, -3.0f, -6.0f};
+    private static final float[] LUFS_TARGETS = {-14.0f, -16.0f, -18.0f, -23.0f};
     private static final int[] HPF_OPTIONS = {0, 80, 120};
+    private static final int[] DEHUM_OPTIONS = {0, 50, 60};
 
     private String presetName;
     private boolean autoApply;
     private float inputGainDb;
+    private int deHumHz;
+    private boolean gateEnabled;
+    private float gateThresholdDb;
     private boolean eqEnabled;
     private int hpfHz;
     private final float[] eqBandsDb;
@@ -61,6 +68,7 @@ public final class DspSheetDialog extends Dialog {
     private float compMakeupDb;
     private boolean normEnabled;
     private float normTargetDb;
+    private boolean normUseLufs;
 
     private final Listener listener;
     private final float dp;
@@ -97,6 +105,9 @@ public final class DspSheetDialog extends Dialog {
         this.presetName = c.presetName;
         this.autoApply = c.autoApply;
         this.inputGainDb = c.inputGainDb;
+        this.deHumHz = c.deHumHz;
+        this.gateEnabled = c.gateEnabled;
+        this.gateThresholdDb = c.gateThresholdDb;
         this.eqEnabled = c.eqEnabled;
         this.hpfHz = c.hpfHz;
         System.arraycopy(c.eqBandsDb, 0, this.eqBandsDb, 0, 5);
@@ -108,14 +119,15 @@ public final class DspSheetDialog extends Dialog {
         this.compMakeupDb = c.compMakeupDb;
         this.normEnabled = c.normEnabled;
         this.normTargetDb = c.normTargetDb;
+        this.normUseLufs = c.normUseLufs;
     }
 
     private DspConfig buildCurrentConfig() {
         return new DspConfig(
-                presetName, autoApply, inputGainDb,
+                presetName, autoApply, inputGainDb, deHumHz, gateEnabled, gateThresholdDb,
                 eqEnabled, hpfHz, eqBandsDb,
                 compEnabled, compThresholdDb, compRatio, compAttackMs, compReleaseMs, compMakeupDb,
-                normEnabled, normTargetDb
+                normEnabled, normTargetDb, normUseLufs
         );
     }
 
@@ -216,7 +228,21 @@ public final class DspSheetDialog extends Dialog {
         pLbl.setLetterSpacing(0.12f);
         presetHdr.addView(pLbl, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
-        TextView saveBtn = pillBtn(ctx, "+ SAVE PRESET", 0xFF00E5A0, 0xFF00E5A0);
+        TextView expBtn = pillBtn(ctx, "EXPORT", 0xFF9A9A9A, 0xFF282828);
+        LinearLayout.LayoutParams expLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        expLp.rightMargin = dp(6);
+        expBtn.setOnClickListener(v -> exportPresetsToClipboard(ctx));
+        presetHdr.addView(expBtn, expLp);
+
+        TextView impBtn = pillBtn(ctx, "IMPORT", 0xFF9A9A9A, 0xFF282828);
+        LinearLayout.LayoutParams impLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        impLp.rightMargin = dp(6);
+        impBtn.setOnClickListener(v -> promptImportPresets(ctx, root));
+        presetHdr.addView(impBtn, impLp);
+
+        TextView saveBtn = pillBtn(ctx, "+ SAVE", 0xFF00E5A0, 0xFF00E5A0);
         saveBtn.setOnClickListener(v -> promptSavePreset(ctx, root));
         presetHdr.addView(saveBtn);
         body.addView(presetHdr);
@@ -249,6 +275,40 @@ public final class DspSheetDialog extends Dialog {
                     emit();
                 }));
         body.addView(gainCard);
+
+        // 2c. Soft Noise Gate + 50/60 Hz De-Hum Mains Notch
+        body.addView(buildSectionToggleHeader(ctx, "NOISE GATE & DE-HUM NOTCH",
+                gateEnabled || deHumHz > 0, () -> {
+                    gateEnabled = !gateEnabled;
+                    if (gateEnabled) autoApply = true;
+                    presetName = "Custom";
+                    emitAndRebuild(ctx, root);
+                }, null, null));
+        LinearLayout gateCard = cardBox(ctx);
+        LinearLayout humRow = new LinearLayout(ctx);
+        humRow.setOrientation(LinearLayout.HORIZONTAL);
+        for (int i = 0; i < DEHUM_OPTIONS.length; i++) {
+            final int hz = DEHUM_OPTIONS[i];
+            String lbl = (hz == 0) ? "DE-HUM OFF" : (hz + "Hz HUM");
+            humRow.addView(chip(ctx, lbl, deHumHz == hz, () -> {
+                deHumHz = hz;
+                if (hz > 0) autoApply = true;
+                presetName = "Custom";
+                emitAndRebuild(ctx, root);
+            }), chipParams(i < DEHUM_OPTIONS.length - 1));
+        }
+        gateCard.addView(humRow);
+        // Gate Threshold: -60..-20 dB (prog 0..40 -> prog - 60)
+        gateCard.addView(sliderRow(ctx, "Gate Thr", 40, Math.max(0, Math.min(40, Math.round(gateThresholdDb + 60f))),
+                prog -> (prog - 60) + " dB",
+                prog -> {
+                    gateThresholdDb = prog - 60f;
+                    gateEnabled = true;
+                    autoApply = true;
+                    presetName = "Custom";
+                    emit();
+                }));
+        body.addView(gateCard);
 
         // 3. 5-Band Studio Equalizer + High-Pass Filter
         body.addView(buildSectionToggleHeader(ctx, "EQUALIZER (5-BAND + HPF)", eqEnabled, () -> {
@@ -349,8 +409,8 @@ public final class DspSheetDialog extends Dialog {
                 }));
         body.addView(compCard);
 
-        // 5. True Peak Normalizer
-        body.addView(buildSectionToggleHeader(ctx, "TRUE PEAK NORMALIZER", normEnabled, () -> {
+        // 5. Normalizer (True Peak dBFS or ITU-R BS.1770 Integrated LUFS)
+        body.addView(buildSectionToggleHeader(ctx, "NORMALIZER (PEAK / LUFS)", normEnabled, () -> {
             normEnabled = !normEnabled;
             if (normEnabled) autoApply = true;
             presetName = "Custom";
@@ -358,8 +418,35 @@ public final class DspSheetDialog extends Dialog {
         }, null, null));
 
         LinearLayout normCard = cardBox(ctx);
+        LinearLayout modeRow = new LinearLayout(ctx);
+        modeRow.setOrientation(LinearLayout.HORIZONTAL);
+        modeRow.setPadding(0, 0, 0, dp(8));
+        modeRow.addView(chip(ctx, "TRUE PEAK (dBFS)", !normUseLufs, () -> {
+            if (normUseLufs) {
+                normUseLufs = false;
+                normTargetDb = -1.0f;
+                normEnabled = true;
+                autoApply = true;
+                presetName = "Custom";
+                emitAndRebuild(ctx, root);
+            }
+        }), chipParams(true));
+        modeRow.addView(chip(ctx, "LOUDNESS (LUFS)", normUseLufs, () -> {
+            if (!normUseLufs) {
+                normUseLufs = true;
+                normTargetDb = -16.0f;
+                normEnabled = true;
+                autoApply = true;
+                presetName = "Custom";
+                emitAndRebuild(ctx, root);
+            }
+        }), chipParams(false));
+        normCard.addView(modeRow);
+
         TextView normDesc = new TextView(ctx);
-        normDesc.setText("Exact constant-gain peak normalization applied automatically on Stop (preserves full dynamics, zero pumping).");
+        normDesc.setText(normUseLufs
+                ? "BS.1770 K-weighted integrated loudness (-16 LUFS podcast / -14 LUFS streaming) with -1 dBFS peak safety cap."
+                : "Exact constant-gain peak normalization applied automatically on Stop (preserves full dynamics, zero pumping).");
         normDesc.setTextColor(0xFF6E6E6E);
         normDesc.setTextSize(11f);
         normDesc.setPadding(0, 0, 0, dp(10));
@@ -367,17 +454,20 @@ public final class DspSheetDialog extends Dialog {
 
         LinearLayout targetRow = new LinearLayout(ctx);
         targetRow.setOrientation(LinearLayout.HORIZONTAL);
-        for (int i = 0; i < NORM_TARGETS.length; i++) {
-            final float tDb = NORM_TARGETS[i];
-            boolean sel = Math.abs(normTargetDb - tDb) < 0.15f;
-            String lbl = String.format(Locale.US, "%.1f dB", tDb);
+        float[] targets = normUseLufs ? LUFS_TARGETS : NORM_TARGETS;
+        for (int i = 0; i < targets.length; i++) {
+            final float tDb = targets[i];
+            boolean sel = Math.abs(normTargetDb - tDb) < 0.25f;
+            String lbl = normUseLufs
+                    ? String.format(Locale.US, "%.0f LUFS", tDb)
+                    : String.format(Locale.US, "%.1f dB", tDb);
             targetRow.addView(chip(ctx, lbl, sel, () -> {
                 normTargetDb = tDb;
                 normEnabled = true;
                 autoApply = true;
                 presetName = "Custom";
                 emitAndRebuild(ctx, root);
-            }), chipParams(i < NORM_TARGETS.length - 1));
+            }), chipParams(i < targets.length - 1));
         }
         normCard.addView(targetRow);
         body.addView(normCard);
@@ -521,6 +611,57 @@ public final class DspSheetDialog extends Dialog {
                     DspPresetStore.saveCustomPreset(ctx, toSave);
                     Toast.makeText(ctx, "Saved preset: " + name, Toast.LENGTH_SHORT).show();
                     emitAndRebuild(ctx, root);
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
+    private void exportPresetsToClipboard(Context ctx) {
+        String json = DspPresetStore.exportPresetsJson(ctx);
+        ClipboardManager cm = (ClipboardManager) ctx.getSystemService(Context.CLIPBOARD_SERVICE);
+        if (cm != null) {
+            cm.setPrimaryClip(ClipData.newPlainText("Rekorder Presets JSON", json));
+            Toast.makeText(ctx, "Presets JSON copied to clipboard", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void promptImportPresets(Context ctx, LinearLayout root) {
+        EditText input = new EditText(ctx);
+        input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
+        input.setMinLines(4);
+        input.setMaxLines(8);
+        input.setHint("Paste exported Rekorder Presets JSON...");
+        input.setTextColor(0xFFF2F2F2);
+        input.setHintTextColor(0xFF666666);
+        input.setTextSize(11f);
+        input.setTypeface(Typeface.MONOSPACE);
+
+        ClipboardManager cm = (ClipboardManager) ctx.getSystemService(Context.CLIPBOARD_SERVICE);
+        if (cm != null && cm.hasPrimaryClip() && cm.getPrimaryClip() != null
+                && cm.getPrimaryClip().getItemCount() > 0) {
+            CharSequence clip = cm.getPrimaryClip().getItemAt(0).coerceToText(ctx);
+            if (clip != null && clip.toString().trim().startsWith("{")) {
+                input.setText(clip.toString());
+            }
+        }
+        int pad = dp(16);
+        LinearLayout wrap = new LinearLayout(ctx);
+        wrap.setPadding(pad, dp(10), pad, dp(4));
+        wrap.addView(input, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        new AlertDialog.Builder(ctx, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setTitle("Import DSP Presets (JSON)")
+                .setView(wrap)
+                .setPositiveButton("Import", (d, which) -> {
+                    int n = DspPresetStore.importPresetsJson(ctx, input.getText().toString());
+                    if (n > 0) {
+                        loadFieldsFrom(DspPresetStore.loadActive(ctx));
+                        Toast.makeText(ctx, "Imported " + n + " preset(s)", Toast.LENGTH_SHORT).show();
+                        emitAndRebuild(ctx, root);
+                    } else {
+                        Toast.makeText(ctx, "Invalid preset JSON", Toast.LENGTH_SHORT).show();
+                    }
                 })
                 .setNegativeButton("Cancel", null)
                 .show();

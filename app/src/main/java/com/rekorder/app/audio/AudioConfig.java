@@ -108,19 +108,26 @@ public final class AudioConfig {
 
     public static final int[] SAMPLE_RATES = {0, 44100, 48000, 96000, 192000};
     public static final int[] BITRATES_KBPS = {128, 192, 256, 320};
+    public static final int[] MAX_DURATION_OPTIONS_MIN = {0, 5, 15, 30, 60, 120};
+    public static final int[] SILENCE_THRESH_OPTIONS_DB = {-35, -45, -55};
 
     public final EngineMode engineMode;
     public final InputPreset inputPreset;
     public final OutputFormat outputFormat;
-    public final int sampleRate;           // 0 = hardware native
-    public final int channelCount;         // 1 or 2
-    public final int deviceId;             // 0 = system default input
-    public final int outputDeviceId;       // 0 = system default output (independent of input!)
-    public final int outputDeviceType;     // AudioDeviceInfo.TYPE_* fallback across reboots
+    public final int sampleRate;            // 0 = hardware native
+    public final int channelCount;          // 1 or 2
+    public final int deviceId;              // 0 = system default input
+    public final int outputDeviceId;        // 0 = system default output (independent of input!)
+    public final int outputDeviceType;      // AudioDeviceInfo.TYPE_* fallback across reboots
     public final boolean keepScreenOn;
-    public final int visualGain;           // 1, 2, or 4 (display-only waveform boost)
+    public final int visualGain;            // 1, 2, or 4 (display-only waveform boost)
     public final int compressedBitrateKbps; // 128, 192, 256, 320 for OGG / MP3
-    public final boolean headphoneMonitor; // Live low-latency pass-through when headphones plugged in
+    public final boolean headphoneMonitor;  // Live low-latency pass-through when headphones plugged in
+    public final boolean silenceSkipEnabled;// VOX: auto-skip dead air after 1.5s below threshold
+    public final int silenceThresholdDb;    // -35, -45, -55 dBFS
+    public final int maxDurationMinutes;    // 0 = unlimited; auto-stop cleanly when reached
+    public final String filenamePrefix;     // sanitized prefix, default "rek"
+    public final boolean volumeKeyTrigger;  // VolUp = Rec/Pause, VolDown = +MARK while recording
 
     private static final String PREFS = "rekorder_prefs";
 
@@ -128,7 +135,8 @@ public final class AudioConfig {
                        int sampleRate, int channelCount, int deviceId,
                        boolean keepScreenOn, int visualGain, int compressedBitrateKbps) {
         this(engineMode, inputPreset, outputFormat, sampleRate, channelCount, deviceId,
-                keepScreenOn, visualGain, compressedBitrateKbps, false, 0, 0);
+                keepScreenOn, visualGain, compressedBitrateKbps, false, 0, 0,
+                false, -45, 0, "rek", false);
     }
 
     public AudioConfig(EngineMode engineMode, InputPreset inputPreset, OutputFormat outputFormat,
@@ -136,7 +144,8 @@ public final class AudioConfig {
                        boolean keepScreenOn, int visualGain, int compressedBitrateKbps,
                        boolean headphoneMonitor) {
         this(engineMode, inputPreset, outputFormat, sampleRate, channelCount, deviceId,
-                keepScreenOn, visualGain, compressedBitrateKbps, headphoneMonitor, 0, 0);
+                keepScreenOn, visualGain, compressedBitrateKbps, headphoneMonitor, 0, 0,
+                false, -45, 0, "rek", false);
     }
 
     public AudioConfig(EngineMode engineMode, InputPreset inputPreset, OutputFormat outputFormat,
@@ -144,13 +153,25 @@ public final class AudioConfig {
                        boolean keepScreenOn, int visualGain, int compressedBitrateKbps,
                        boolean headphoneMonitor, int outputDeviceId) {
         this(engineMode, inputPreset, outputFormat, sampleRate, channelCount, deviceId,
-                keepScreenOn, visualGain, compressedBitrateKbps, headphoneMonitor, outputDeviceId, 0);
+                keepScreenOn, visualGain, compressedBitrateKbps, headphoneMonitor, outputDeviceId, 0,
+                false, -45, 0, "rek", false);
     }
 
     public AudioConfig(EngineMode engineMode, InputPreset inputPreset, OutputFormat outputFormat,
                        int sampleRate, int channelCount, int deviceId,
                        boolean keepScreenOn, int visualGain, int compressedBitrateKbps,
                        boolean headphoneMonitor, int outputDeviceId, int outputDeviceType) {
+        this(engineMode, inputPreset, outputFormat, sampleRate, channelCount, deviceId,
+                keepScreenOn, visualGain, compressedBitrateKbps, headphoneMonitor,
+                outputDeviceId, outputDeviceType, false, -45, 0, "rek", false);
+    }
+
+    public AudioConfig(EngineMode engineMode, InputPreset inputPreset, OutputFormat outputFormat,
+                       int sampleRate, int channelCount, int deviceId,
+                       boolean keepScreenOn, int visualGain, int compressedBitrateKbps,
+                       boolean headphoneMonitor, int outputDeviceId, int outputDeviceType,
+                       boolean silenceSkipEnabled, int silenceThresholdDb,
+                       int maxDurationMinutes, String filenamePrefix, boolean volumeKeyTrigger) {
         this.engineMode = engineMode;
         this.inputPreset = inputPreset;
         this.outputFormat = outputFormat;
@@ -165,6 +186,18 @@ public final class AudioConfig {
                 || compressedBitrateKbps == 256 || compressedBitrateKbps == 320)
                 ? compressedBitrateKbps : 192;
         this.headphoneMonitor = headphoneMonitor;
+        this.silenceSkipEnabled = silenceSkipEnabled;
+        this.silenceThresholdDb = Math.max(-65, Math.min(-20, silenceThresholdDb));
+        this.maxDurationMinutes = Math.max(0, Math.min(720, maxDurationMinutes));
+        this.filenamePrefix = sanitizePrefix(filenamePrefix);
+        this.volumeKeyTrigger = volumeKeyTrigger;
+    }
+
+    public static String sanitizePrefix(String raw) {
+        if (raw == null) return "rek";
+        String cleaned = raw.trim().replaceAll("[^A-Za-z0-9_-]", "");
+        if (cleaned.length() > 24) cleaned = cleaned.substring(0, 24);
+        return cleaned.isEmpty() ? "rek" : cleaned;
     }
 
     public static AudioConfig load(Context ctx) {
@@ -181,7 +214,12 @@ public final class AudioConfig {
                 sp.getInt("bitrate_kbps", 192),
                 sp.getBoolean("headphone_monitor", false),
                 sp.getInt("output_device_id", 0),
-                sp.getInt("output_device_type", 0)
+                sp.getInt("output_device_type", 0),
+                sp.getBoolean("silence_skip", false),
+                sp.getInt("silence_thresh_db", -45),
+                sp.getInt("max_duration_min", 0),
+                sp.getString("filename_prefix", "rek"),
+                sp.getBoolean("volume_key_trigger", false)
         );
     }
 
@@ -199,13 +237,19 @@ public final class AudioConfig {
                 .putInt("visual_gain", visualGain)
                 .putInt("bitrate_kbps", compressedBitrateKbps)
                 .putBoolean("headphone_monitor", headphoneMonitor)
+                .putBoolean("silence_skip", silenceSkipEnabled)
+                .putInt("silence_thresh_db", silenceThresholdDb)
+                .putInt("max_duration_min", maxDurationMinutes)
+                .putString("filename_prefix", filenamePrefix)
+                .putBoolean("volume_key_trigger", volumeKeyTrigger)
                 .apply();
     }
 
     public AudioConfig withVisualGain(int newGain) {
         return new AudioConfig(engineMode, inputPreset, outputFormat, sampleRate, channelCount,
                 deviceId, keepScreenOn, newGain, compressedBitrateKbps, headphoneMonitor,
-                outputDeviceId, outputDeviceType);
+                outputDeviceId, outputDeviceType, silenceSkipEnabled, silenceThresholdDb,
+                maxDurationMinutes, filenamePrefix, volumeKeyTrigger);
     }
 
     public String formatShortDisplay() {

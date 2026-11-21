@@ -10,6 +10,7 @@ import android.os.ParcelFileDescriptor;
 
 import com.rekorder.app.dsp.DspChain;
 import com.rekorder.app.dsp.DspConfig;
+import com.rekorder.app.storage.MarkerStore;
 import com.rekorder.app.storage.RecordingStorage;
 
 import java.io.File;
@@ -19,12 +20,17 @@ import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.channels.FileChannel;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
 
 /**
  * Non-destructive offline audio processor for existing recordings:
- *  - Trim / Crop ([trimStartMs, trimEndMs])
- *  - Apply DSP preset (Input Gain + HPF + 5-Band EQ + Soft-Knee Compressor + 2-Pass Normalizer)
+ *  - Trim / Crop ([trimStartMs, trimEndMs]) OR Cut-Out Middle (remove [trimStartMs, trimEndMs])
+ *  - Smooth cosine Fade-In / Fade-Out
+ *  - Apply DSP preset (Preamp + De-Hum + Noise Gate + HPF + 5-Band EQ + Soft-Knee Compressor +
+ *    2-Pass True Peak or BS.1770 LUFS Normalizer)
+ *  - Split recording at bookmarks into separate chapter files
  *  - Convert / Export to WAV (16/24/32f), RAW, FLAC, OGG Opus, or MP3
  *
  * Always writes to a new file so original takes are never modified or lost.
@@ -59,6 +65,26 @@ public final class AudioProcessor {
             int bitrateKbps,
             ProgressListener progress
     ) throws IOException {
+        return processFile(ctx, srcUri, srcFileName, srcMeta, trimStartMs, trimEndMs,
+                false, 0, 0, null, dspConfig, outFormat, bitrateKbps, progress);
+    }
+
+    public static ProcessResult processFile(
+            Context ctx,
+            Uri srcUri,
+            String srcFileName,
+            WavWriter.AudioFileMeta srcMeta,
+            long trimStartMs,
+            long trimEndMs,
+            boolean cutMiddle,
+            int fadeInMs,
+            int fadeOutMs,
+            String customSuffix,
+            DspConfig dspConfig,
+            AudioConfig.OutputFormat outFormat,
+            int bitrateKbps,
+            ProgressListener progress
+    ) throws IOException {
         if (srcUri == null || srcMeta == null) {
             throw new IOException("No recording loaded");
         }
@@ -72,12 +98,35 @@ public final class AudioProcessor {
         boolean applyDsp = dspConfig != null && dspConfig.hasRealTimeFx();
         boolean applyNorm = dspConfig != null && dspConfig.hasNormalizer();
         boolean isTrimmed = (startMs > 10L || endMs < durMs - 10L);
+        if (cutMiddle && !isTrimmed) {
+            throw new IOException("Select an inner range to cut out");
+        }
+
+        // Compute expected output duration & frames for accurate fade-out placement
+        long outDurMs = cutMiddle
+                ? Math.max(1L, startMs + (durMs - endMs))
+                : Math.max(1L, endMs - startMs);
+        long totalOutFrames = Math.max(1L, (outDurMs * srcMeta.sampleRate) / 1000L);
+        long fadeInFrames = Math.min(totalOutFrames / 2L, (Math.max(0, fadeInMs) * (long) srcMeta.sampleRate) / 1000L);
+        long fadeOutFrames = Math.min(totalOutFrames / 2L, (Math.max(0, fadeOutMs) * (long) srcMeta.sampleRate) / 1000L);
 
         // Build clean non-destructive output filename preserving original base name
         String base = srcFileName != null ? srcFileName : "recording";
         int dot = base.lastIndexOf('.');
         if (dot > 0) base = base.substring(0, dot);
-        String tag = isTrimmed ? "_trim" : (applyDsp || applyNorm ? "_fx" : "_conv");
+        String tag;
+        if (customSuffix != null && !customSuffix.isEmpty()) {
+            tag = customSuffix;
+        } else if (cutMiddle) {
+            tag = "_cut";
+        } else if (isTrimmed) {
+            tag = "_trim";
+        } else if (applyDsp || applyNorm || fadeInMs > 0 || fadeOutMs > 0) {
+            tag = "_fx";
+        } else {
+            tag = "_conv";
+        }
+
         String outName;
         if (outFormat.hasWavHeader || outFormat.isCompressed) {
             outName = base + tag + "." + outFormat.extension;
@@ -90,17 +139,23 @@ public final class AudioProcessor {
         boolean ok = false;
 
         try {
-            // If normalizing, pass 1 decodes+trims+applies DSP to a float32 scratch while measuring true peak,
-            // then pass 2 normalizes & encodes into target in a single clean pass (zero double-loss!).
             if (applyNorm) {
                 File sDir = RecordingStorage.getBestScratchDir(ctx);
                 scratchFile = new File(sDir, "rek_proc_" + System.currentTimeMillis() + ".f32");
-                float maxPeak;
+                final float[] maxPeakHolder = new float[]{0f};
+                final DspChain.LufsMeter lufsMeter = dspConfig.normUseLufs
+                        ? new DspChain.LufsMeter(srcMeta.sampleRate, srcMeta.channels) : null;
+                final PcmConverter.MeterResult peakMeter = new PcmConverter.MeterResult();
+
                 try (RandomAccessFile sraf = new RandomAccessFile(scratchFile, "rw")) {
                     FileChannel sch = sraf.getChannel();
-                    maxPeak = streamDecodeAndDsp(ctx, srcUri, srcMeta, startMs, endMs, dspConfig,
+                    streamEditPipeline(ctx, srcUri, srcMeta, startMs, endMs, durMs, cutMiddle,
+                            totalOutFrames, fadeInFrames, fadeOutFrames, dspConfig,
                             (buf, frames, sr, ch) -> {
                                 int bytes = frames * ch * 4;
+                                PcmConverter.computeMeter(buf, bytes, PcmConverter.FMT_PCM_FLOAT, ch, peakMeter);
+                                if (peakMeter.peak > maxPeakHolder[0]) maxPeakHolder[0] = peakMeter.peak;
+                                if (lufsMeter != null) lufsMeter.feedInterleavedFloat(buf, frames);
                                 buf.limit(bytes);
                                 buf.position(0);
                                 while (buf.hasRemaining()) {
@@ -114,32 +169,42 @@ public final class AudioProcessor {
                     sch.force(false);
                 }
 
+                float gain;
+                if (lufsMeter != null) {
+                    float measuredLufs = lufsMeter.getIntegratedLufs();
+                    gain = DspChain.computeLufsGain(measuredLufs, dspConfig.normTargetDb, maxPeakHolder[0]);
+                } else {
+                    gain = (maxPeakHolder[0] > 1e-6f)
+                            ? DspChain.computeNormalizeGain(maxPeakHolder[0], dspConfig.normTargetDb)
+                            : 1.0f;
+                }
+
                 target = RecordingStorage.createNamedTarget(ctx, outName, false);
                 long outBytes;
                 if (outFormat.isCompressed) {
-                    PostNormalizer.normalizeAndEncodeCompressed(
+                    PostNormalizer.normalizeAndEncodeCompressedByGain(
                             scratchFile, target.channel, outFormat,
                             srcMeta.sampleRate, srcMeta.channels, bitrateKbps,
-                            maxPeak, dspConfig.normTargetDb,
+                            gain,
                             (done, total, pct) -> {
                                 if (progress != null) progress.onProgress(done, total, 50 + pct / 2);
                             });
                     outBytes = target.channel.size();
                 } else {
-                    outBytes = writeNormalizedScratchToPcm(
+                    outBytes = writeNormalizedScratchToPcmByGain(
                             scratchFile, target.channel, outFormat,
-                            srcMeta.sampleRate, srcMeta.channels,
-                            maxPeak, dspConfig.normTargetDb,
+                            srcMeta.sampleRate, srcMeta.channels, gain,
                             (done, total, pct) -> {
                                 if (progress != null) progress.onProgress(done, total, 50 + pct / 2);
                             });
                 }
                 target.close();
                 ok = outBytes > 0L;
-                String note = buildSummary(isTrimmed, applyDsp, true, outFormat);
+                String note = buildSummary(isTrimmed, cutMiddle, fadeInMs > 0 || fadeOutMs > 0,
+                        applyDsp, true, dspConfig.normUseLufs, outFormat);
                 return new ProcessResult(target.uri, target.displayName, outBytes, note);
             } else {
-                // Single-pass direct stream (super fast!)
+                // Single-pass direct stream
                 target = RecordingStorage.createNamedTarget(ctx, outName, false);
                 final WavWriter[] wavHolder = new WavWriter[1];
                 final Mp3FileWriter[] mp3Holder = new Mp3FileWriter[1];
@@ -161,7 +226,8 @@ public final class AudioProcessor {
                 }
 
                 try {
-                    streamDecodeAndDsp(ctx, srcUri, srcMeta, startMs, endMs, dspConfig,
+                    streamEditPipeline(ctx, srcUri, srcMeta, startMs, endMs, durMs, cutMiddle,
+                            totalOutFrames, fadeInFrames, fadeOutFrames, dspConfig,
                             (buf, frames, sr, ch) -> {
                                 if (mp3Holder[0] != null) {
                                     mp3Holder[0].writeFloatFrames(buf, frames);
@@ -196,7 +262,8 @@ public final class AudioProcessor {
                     ok = outBytes > 0L;
                     if (progress != null) progress.onProgress(outBytes, outBytes, 100);
                     return new ProcessResult(target.uri, target.displayName, outBytes,
-                            buildSummary(isTrimmed, applyDsp, false, outFormat));
+                            buildSummary(isTrimmed, cutMiddle, fadeInMs > 0 || fadeOutMs > 0,
+                                    applyDsp, false, false, outFormat));
                 } finally {
                     if (mp3Holder[0] != null) try { mp3Holder[0].finalizeAndFlush(); } catch (Throwable ignored) {}
                     if (oggHolder[0] != null) try { oggHolder[0].finalizeAndFlush(); } catch (Throwable ignored) {}
@@ -215,25 +282,173 @@ public final class AudioProcessor {
         }
     }
 
+    /**
+     * Splits a recording into separate non-destructive chapter files at every bookmark timestamp.
+     */
+    public static List<ProcessResult> splitAtMarkers(
+            Context ctx,
+            Uri srcUri,
+            String srcFileName,
+            WavWriter.AudioFileMeta srcMeta,
+            List<MarkerStore.MarkerEntry> markers,
+            int fadeInMs,
+            int fadeOutMs,
+            DspConfig dspConfig,
+            AudioConfig.OutputFormat outFormat,
+            int bitrateKbps,
+            ProgressListener progress
+    ) throws IOException {
+        if (srcUri == null || srcMeta == null) throw new IOException("No recording loaded");
+        long durMs = Math.max(1L, srcMeta.durationMs());
+        List<Long> cuts = new ArrayList<>();
+        List<String> labels = new ArrayList<>();
+        cuts.add(0L);
+        labels.add("");
+        if (markers != null) {
+            for (MarkerStore.MarkerEntry m : markers) {
+                if (m.timeMs > 200L && m.timeMs < durMs - 200L) {
+                    if (m.timeMs - cuts.get(cuts.size() - 1) >= 200L) {
+                        cuts.add(m.timeMs);
+                        labels.add(m.label);
+                    }
+                }
+            }
+        }
+        cuts.add(durMs);
+        int segCount = cuts.size() - 1;
+        if (segCount < 2) {
+            throw new IOException("Add at least 1 marker inside the recording to split");
+        }
+
+        List<ProcessResult> results = new ArrayList<>(segCount);
+        for (int i = 0; i < segCount; i++) {
+            final int segIdx = i;
+            long sMs = cuts.get(i);
+            long eMs = cuts.get(i + 1);
+            String lbl = (i < labels.size()) ? labels.get(i) : "";
+            String cleanLbl = lbl.replaceAll("[^A-Za-z0-9_-]", "");
+            if (cleanLbl.length() > 16) cleanLbl = cleanLbl.substring(0, 16);
+            String sfx = String.format(Locale.US, "_part%02d%s", i + 1, cleanLbl.isEmpty() ? "" : ("_" + cleanLbl));
+            ProcessResult r = processFile(ctx, srcUri, srcFileName, srcMeta, sMs, eMs,
+                    false, fadeInMs, fadeOutMs, sfx, dspConfig, outFormat, bitrateKbps,
+                    (done, total, pct) -> {
+                        if (progress != null) {
+                            int overall = Math.min(99, (segIdx * 100 + pct) / segCount);
+                            progress.onProgress(segIdx + 1, segCount, overall);
+                        }
+                    });
+            results.add(r);
+        }
+        if (progress != null) progress.onProgress(segCount, segCount, 100);
+        return results;
+    }
+
+    /** Public helper for unit-testing smooth cosine fade curves directly on float32 PCM. */
+    public static void applyCosineFade(ByteBuffer floatBuf, int frames, int channels,
+                                       long globalFrameStart, long totalFrames,
+                                       long fadeInFrames, long fadeOutFrames) {
+        if (fadeInFrames <= 0L && fadeOutFrames <= 0L) return;
+        floatBuf.order(ByteOrder.LITTLE_ENDIAN);
+        long fadeOutStart = Math.max(0L, totalFrames - fadeOutFrames);
+        for (int f = 0; f < frames; f++) {
+            long gf = globalFrameStart + f;
+            float gain = 1.0f;
+            if (fadeInFrames > 0L && gf < fadeInFrames) {
+                double t = (double) gf / (double) fadeInFrames;
+                gain *= (float) (0.5 * (1.0 - Math.cos(Math.PI * t)));
+            }
+            if (fadeOutFrames > 0L && gf >= fadeOutStart) {
+                long rem = totalFrames - 1L - gf;
+                double t = (rem <= 0L) ? 0.0 : ((double) rem / (double) fadeOutFrames);
+                gain *= (float) (0.5 * (1.0 - Math.cos(Math.PI * Math.min(1.0, t))));
+            }
+            if (gain < 0.9999f) {
+                int off = f * channels * 4;
+                for (int c = 0; c < channels; c++) {
+                    floatBuf.putFloat(off + (c << 2), floatBuf.getFloat(off + (c << 2)) * gain);
+                }
+            }
+        }
+    }
+
     private interface FloatSink {
         void accept(ByteBuffer floatBuf, int frames, int sr, int ch) throws IOException;
     }
 
-    private static float streamDecodeAndDsp(
+    private static void streamEditPipeline(
             Context ctx, Uri srcUri, WavWriter.AudioFileMeta meta,
-            long startMs, long endMs, DspConfig dspConfig,
-            FloatSink sink, ProgressListener progress) throws IOException {
+            long startMs, long endMs, long durMs, boolean cutMiddle,
+            long totalOutFrames, long fadeInFrames, long fadeOutFrames,
+            DspConfig dspConfig, FloatSink sink, ProgressListener progress) throws IOException {
+
+        final long[] outCursor = new long[]{0L};
+        FloatSink fadedSink = (buf, frames, sr, ch) -> {
+            applyCosineFade(buf, frames, ch, outCursor[0], totalOutFrames, fadeInFrames, fadeOutFrames);
+            outCursor[0] += frames;
+            sink.accept(buf, frames, sr, ch);
+        };
 
         boolean runDsp = dspConfig != null && dspConfig.hasRealTimeFx();
         DspChain dsp = runDsp ? new DspChain(meta.sampleRate, meta.channels, dspConfig) : null;
 
-        if (!meta.isCompressed) {
-            return streamPcmSource(ctx, srcUri, meta, startMs, endMs, dsp, sink, progress);
+        if (!cutMiddle) {
+            streamRange(ctx, srcUri, meta, startMs, endMs, dsp, fadedSink, progress);
+            return;
         }
-        return streamCompressedSource(ctx, srcUri, meta, startMs, endMs, dsp, sink, progress);
+
+        // Cut-out middle: stream [0..startMs] with tiny 10ms clickless edge fade-out,
+        // then [endMs..durMs] with tiny 10ms clickless edge fade-in.
+        long spliceFrames = Math.max(1L, (meta.sampleRate * 10L) / 1000L);
+        long part1Frames = (startMs * meta.sampleRate) / 1000L;
+        long part2Frames = ((durMs - endMs) * meta.sampleRate) / 1000L;
+        boolean hasPart1 = startMs > 10L;
+        boolean hasPart2 = endMs < durMs - 10L;
+
+        if (hasPart1) {
+            final long[] p1Pos = new long[]{0L};
+            long edgeOut = hasPart2 ? Math.min(spliceFrames, part1Frames / 2L) : 0L;
+            streamRange(ctx, srcUri, meta, 0L, startMs, dsp,
+                    (buf, frames, sr, ch) -> {
+                        if (edgeOut > 0L) {
+                            applyCosineFade(buf, frames, ch, p1Pos[0], part1Frames, 0L, edgeOut);
+                        }
+                        p1Pos[0] += frames;
+                        fadedSink.accept(buf, frames, sr, ch);
+                    },
+                    (done, total, pct) -> {
+                        if (progress != null) progress.onProgress(done, total, hasPart2 ? pct / 2 : pct);
+                    });
+        }
+        if (hasPart2) {
+            if (dsp != null) dsp.resetState();
+            final long[] p2Pos = new long[]{0L};
+            long edgeIn = hasPart1 ? Math.min(spliceFrames, part2Frames / 2L) : 0L;
+            streamRange(ctx, srcUri, meta, endMs, durMs, dsp,
+                    (buf, frames, sr, ch) -> {
+                        if (edgeIn > 0L) {
+                            applyCosineFade(buf, frames, ch, p2Pos[0], part2Frames, edgeIn, 0L);
+                        }
+                        p2Pos[0] += frames;
+                        fadedSink.accept(buf, frames, sr, ch);
+                    },
+                    (done, total, pct) -> {
+                        if (progress != null) progress.onProgress(done, total, hasPart1 ? (50 + pct / 2) : pct);
+                    });
+        }
     }
 
-    private static float streamPcmSource(
+    private static void streamRange(
+            Context ctx, Uri srcUri, WavWriter.AudioFileMeta meta,
+            long startMs, long endMs, DspChain dsp,
+            FloatSink sink, ProgressListener progress) throws IOException {
+        if (!meta.isCompressed) {
+            streamPcmSource(ctx, srcUri, meta, startMs, endMs, dsp, sink, progress);
+        } else {
+            streamCompressedSource(ctx, srcUri, meta, startMs, endMs, dsp, sink, progress);
+        }
+    }
+
+    private static void streamPcmSource(
             Context ctx, Uri srcUri, WavWriter.AudioFileMeta meta,
             long startMs, long endMs, DspChain dsp,
             FloatSink sink, ProgressListener progress) throws IOException {
@@ -247,8 +462,6 @@ public final class AudioProcessor {
         int chunkFrames = 4096;
         ByteBuffer rawBuf = ByteBuffer.allocate(chunkFrames * bpf).order(ByteOrder.LITTLE_ENDIAN);
         ByteBuffer floatBuf = ByteBuffer.allocateDirect(chunkFrames * meta.channels * 4).order(ByteOrder.LITTLE_ENDIAN);
-        PcmConverter.MeterResult meter = new PcmConverter.MeterResult();
-        float maxPeak = 0f;
 
         try (ParcelFileDescriptor pfd = ctx.getContentResolver().openFileDescriptor(srcUri, "r")) {
             if (pfd == null) throw new IOException("Cannot open source file");
@@ -274,13 +487,11 @@ public final class AudioProcessor {
                     int frames = got / bpf;
                     if (frames <= 0) break;
 
-                    int fb = PcmConverter.convertToOutput(
+                    PcmConverter.convertToOutput(
                             rawBuf, frames * bpf, meta.pcmFormat, AudioConfig.OutputFormat.WAV_32F, floatBuf);
                     if (dsp != null) {
                         dsp.processInPlace(floatBuf, frames);
                     }
-                    PcmConverter.computeMeter(floatBuf, fb, PcmConverter.FMT_PCM_FLOAT, meta.channels, meter);
-                    if (meter.peak > maxPeak) maxPeak = meter.peak;
 
                     sink.accept(floatBuf, frames, meta.sampleRate, meta.channels);
                     doneFrames += frames;
@@ -297,10 +508,9 @@ public final class AudioProcessor {
                 if (progress != null) progress.onProgress(totalBytes, totalBytes, 100);
             }
         }
-        return maxPeak;
     }
 
-    private static float streamCompressedSource(
+    private static void streamCompressedSource(
             Context ctx, Uri srcUri, WavWriter.AudioFileMeta meta,
             long startMs, long endMs, DspChain dsp,
             FloatSink sink, ProgressListener progress) throws IOException {
@@ -308,7 +518,6 @@ public final class AudioProcessor {
         MediaExtractor extractor = new MediaExtractor();
         MediaCodec codec = null;
         ParcelFileDescriptor pfd = null;
-        float maxPeak = 0f;
 
         try {
             pfd = ctx.getContentResolver().openFileDescriptor(srcUri, "r");
@@ -345,7 +554,6 @@ public final class AudioProcessor {
             long decodedFrames = 0L;
 
             ByteBuffer floatBuf = ByteBuffer.allocateDirect(65536 * 2).order(ByteOrder.LITTLE_ENDIAN);
-            PcmConverter.MeterResult meter = new PcmConverter.MeterResult();
             MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
             boolean inputDone = false;
             boolean outputDone = false;
@@ -354,7 +562,7 @@ public final class AudioProcessor {
 
             while (!outputDone) {
                 if (!inputDone) {
-                    int inIdx = codec.dequeueInputBuffer(10000);
+                    int inIdx = codec.dequeueInputBuffer(5000);
                     if (inIdx >= 0) {
                         ByteBuffer inBuf = codec.getInputBuffer(inIdx);
                         if (inBuf != null) {
@@ -372,42 +580,41 @@ public final class AudioProcessor {
 
                 int outIdx = codec.dequeueOutputBuffer(info, 10000);
                 if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                    MediaFormat of = codec.getOutputFormat();
-                    if (of.containsKey(MediaFormat.KEY_SAMPLE_RATE)) sr = of.getInteger(MediaFormat.KEY_SAMPLE_RATE);
-                    if (of.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) ch = of.getInteger(MediaFormat.KEY_CHANNEL_COUNT);
+                    MediaFormat outFmt = codec.getOutputFormat();
+                    if (outFmt.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
+                        sr = outFmt.getInteger(MediaFormat.KEY_SAMPLE_RATE);
+                    }
+                    if (outFmt.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
+                        ch = outFmt.getInteger(MediaFormat.KEY_CHANNEL_COUNT);
+                    }
                 } else if (outIdx >= 0) {
                     ByteBuffer outBuf = codec.getOutputBuffer(outIdx);
                     if (outBuf != null && info.size > 0) {
-                        outBuf.order(ByteOrder.LITTLE_ENDIAN);
-                        outBuf.limit(info.offset + info.size);
-                        outBuf.position(info.offset);
-                        int bpf = ch * 2;
-                        int frames = info.size / Math.max(1, bpf);
+                        int frameBytesI16 = ch * 2;
+                        int totalOut = info.size / frameBytesI16;
+                        long segStart = decodedFrames;
+                        long segEnd = decodedFrames + totalOut;
+                        decodedFrames = segEnd;
 
-                        long chunkStart = decodedFrames;
-                        long chunkEnd = decodedFrames + frames;
-                        decodedFrames = chunkEnd;
-
-                        long keepStart = Math.max(chunkStart, startFrame);
-                        long keepEnd = Math.min(chunkEnd, endFrame);
+                        long keepStart = Math.max(segStart, startFrame);
+                        long keepEnd = Math.min(segEnd, endFrame);
                         if (keepEnd > keepStart) {
-                            int skipInChunk = (int) (keepStart - chunkStart);
+                            int skipFrames = (int) (keepStart - segStart);
                             int keepFrames = (int) (keepEnd - keepStart);
                             int needFloatBytes = keepFrames * ch * 4;
                             if (floatBuf.capacity() < needFloatBytes) {
                                 floatBuf = ByteBuffer.allocateDirect(needFloatBytes).order(ByteOrder.LITTLE_ENDIAN);
                             }
-                            floatBuf.clear();
-                            int samples = keepFrames * ch;
-                            int srcOff = info.offset + skipInChunk * bpf;
-                            for (int i = 0; i < samples; i++) {
-                                floatBuf.putFloat(i << 2, outBuf.getShort(srcOff + (i << 1)) * (1.0f / 32768.0f));
+                            outBuf.order(ByteOrder.LITTLE_ENDIAN);
+                            int baseByte = info.offset + skipFrames * frameBytesI16;
+                            int totalSamples = keepFrames * ch;
+                            for (int i = 0; i < totalSamples; i++) {
+                                short s = outBuf.getShort(baseByte + (i << 1));
+                                floatBuf.putFloat(i << 2, s / 32768.0f);
                             }
                             if (dsp != null) {
                                 dsp.processInPlace(floatBuf, keepFrames);
                             }
-                            PcmConverter.computeMeter(floatBuf, needFloatBytes, PcmConverter.FMT_PCM_FLOAT, ch, meter);
-                            if (meter.peak > maxPeak) maxPeak = meter.peak;
                             sink.accept(floatBuf, keepFrames, sr, ch);
                         }
 
@@ -441,14 +648,13 @@ public final class AudioProcessor {
                 try { pfd.close(); } catch (IOException ignored) {}
             }
         }
-        return maxPeak;
     }
 
-    private static long writeNormalizedScratchToPcm(
+    private static long writeNormalizedScratchToPcmByGain(
             File scratchFile, FileChannel targetChannel, AudioConfig.OutputFormat outFormat,
-            int sampleRate, int channels, float maxPeak, float targetDb, ProgressListener progress)
+            int sampleRate, int channels, float gain, ProgressListener progress)
             throws IOException {
-        float gain = (maxPeak > 1e-6f) ? DspChain.computeNormalizeGain(maxPeak, targetDb) : 1.0f;
+        if (!Float.isFinite(gain) || gain <= 0f) gain = 1.0f;
         int bpf = channels * 4;
         int chunkFrames = 8192;
         ByteBuffer fBuf = ByteBuffer.allocate(chunkFrames * bpf).order(ByteOrder.LITTLE_ENDIAN);
@@ -499,11 +705,15 @@ public final class AudioProcessor {
         }
     }
 
-    private static String buildSummary(boolean trimmed, boolean fx, boolean norm, AudioConfig.OutputFormat fmt) {
+    private static String buildSummary(boolean trimmed, boolean cutMiddle, boolean faded,
+                                       boolean fx, boolean norm, boolean lufs,
+                                       AudioConfig.OutputFormat fmt) {
         StringBuilder sb = new StringBuilder();
-        if (trimmed) sb.append("Trimmed");
+        if (cutMiddle) sb.append("Cut");
+        else if (trimmed) sb.append("Trimmed");
+        if (faded) { if (sb.length() > 0) sb.append(" + "); sb.append("Faded"); }
         if (fx) { if (sb.length() > 0) sb.append(" + "); sb.append("FX"); }
-        if (norm) { if (sb.length() > 0) sb.append(" + "); sb.append("Normalized"); }
+        if (norm) { if (sb.length() > 0) sb.append(" + "); sb.append(lufs ? "LUFS" : "Norm"); }
         if (sb.length() == 0) sb.append("Converted");
         sb.append(" -> ").append(fmt.shortLabel);
         return sb.toString();

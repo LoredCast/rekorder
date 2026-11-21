@@ -27,6 +27,7 @@ import android.os.PowerManager;
 import com.rekorder.app.audio.AudioConfig;
 import com.rekorder.app.audio.RawAudioPlayer;
 import com.rekorder.app.audio.WavWriter;
+import com.rekorder.app.dsp.DspConfig;
 
 /**
  * Dedicated foreground media playback service enabling uninterrupted background playback
@@ -332,6 +333,26 @@ public final class PlaybackService extends Service implements RawAudioPlayer.Lis
             player.seekByDeltaMs(deltaMs);
             pushPlaybackState(player.isPlaying(), player.getCurrentPositionMs());
         }
+    }
+
+    public void setLiveDsp(boolean enabled, DspConfig cfg) {
+        if (player != null) {
+            player.setLiveDsp(enabled, cfg);
+        }
+    }
+
+    public boolean isLiveDspEnabled() {
+        return player != null && player.isLiveDspEnabled();
+    }
+
+    public void setLoopRange(long startMs, long endMs) {
+        if (player != null) {
+            player.setLoopRange(startMs, endMs);
+        }
+    }
+
+    public boolean isLoopActive() {
+        return player != null && player.isLoopActive();
     }
 
     public synchronized void stopPlayback() {

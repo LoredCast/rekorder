@@ -30,9 +30,15 @@ public final class EditExportDialog extends Dialog {
 
     public interface Listener {
         void onToggleWaveformTrim();
-        void onExportRequested(long trimStartMs, long trimEndMs, DspConfig dspToApply,
+        void onExportRequested(long trimStartMs, long trimEndMs, boolean cutMiddle,
+                               int fadeInMs, int fadeOutMs, DspConfig dspToApply,
                                AudioConfig.OutputFormat outFormat, int bitrateKbps);
+        void onSplitAtMarkersRequested(int fadeInMs, int fadeOutMs, DspConfig dspToApply,
+                                       AudioConfig.OutputFormat outFormat, int bitrateKbps);
     }
+
+    private static final int[] FADE_OPTIONS_MS = {0, 500, 1500, 3000};
+    private static final String[] FADE_LABELS = {"OFF", "0.5s", "1.5s", "3s"};
 
     private static final AudioConfig.OutputFormat[] EXPORT_FORMATS = {
             AudioConfig.OutputFormat.WAV_24,
@@ -47,17 +53,22 @@ public final class EditExportDialog extends Dialog {
     private final long durationMs;
     private final long trimStartMs;
     private final long trimEndMs;
+    private final int markerCount;
     private final DspConfig activePreset;
     private final Listener listener;
     private final float dp;
 
+    private boolean cutMiddle = false;
+    private int fadeInMs = 0;
+    private int fadeOutMs = 0;
     private boolean applyPresetDsp;
     private boolean applyNormOnly;
+    private boolean applyLufsOnly;
     private AudioConfig.OutputFormat outFormat;
     private int bitrateKbps;
 
     public EditExportDialog(Context ctx, String fileName, long durationMs,
-                            long trimStartMs, long trimEndMs,
+                            long trimStartMs, long trimEndMs, int markerCount,
                             DspConfig activePreset, AudioConfig currentAudioCfg,
                             Listener listener) {
         super(ctx, R.style.Theme_Rekorder_Dialog);
@@ -65,9 +76,11 @@ public final class EditExportDialog extends Dialog {
         this.durationMs = Math.max(1L, durationMs);
         this.trimStartMs = Math.max(0L, Math.min(trimStartMs, durationMs));
         this.trimEndMs = (trimEndMs > this.trimStartMs) ? trimEndMs : this.durationMs;
+        this.markerCount = Math.max(0, markerCount);
         this.activePreset = (activePreset != null) ? activePreset : DspConfig.rawBypass();
         this.applyPresetDsp = this.activePreset.hasAnyActiveFx();
         this.applyNormOnly = false;
+        this.applyLufsOnly = false;
         this.outFormat = (currentAudioCfg != null && currentAudioCfg.outputFormat != AudioConfig.OutputFormat.RAW_24
                 && currentAudioCfg.outputFormat != AudioConfig.OutputFormat.RAW_32F)
                 ? currentAudioCfg.outputFormat : AudioConfig.OutputFormat.WAV_24;
@@ -150,19 +163,41 @@ public final class EditExportDialog extends Dialog {
         srcTv.setTypeface(Typeface.MONOSPACE);
         body.addView(srcTv);
 
-        // 1. Trim Range
-        body.addView(sectionLabel(ctx, "1. TRIM SELECTION"));
+        // 1. Trim / Cut Selection + Fade In/Out
+        body.addView(sectionLabel(ctx, "1. TRIM / CUT & FADES"));
         boolean isTrimmed = (trimStartMs > 10L || trimEndMs < durationMs - 10L);
+        if (!isTrimmed) cutMiddle = false;
         LinearLayout trimCard = cardBox(ctx);
         TextView trimInfo = new TextView(ctx);
-        trimInfo.setText(isTrimmed
-                ? String.format(Locale.US, "IN %s  ->  OUT %s  (KEEP %s)",
-                        fmtMs(trimStartMs), fmtMs(trimEndMs), fmtMs(trimEndMs - trimStartMs))
-                : "FULL TAKE (" + fmtMs(durationMs) + ")");
+        if (isTrimmed) {
+            long resultMs = cutMiddle ? (trimStartMs + (durationMs - trimEndMs)) : (trimEndMs - trimStartMs);
+            trimInfo.setText(String.format(Locale.US, "%s %s -> %s  (OUT %s)",
+                    cutMiddle ? "CUT OUT" : "KEEP",
+                    fmtMs(trimStartMs), fmtMs(trimEndMs), fmtMs(resultMs)));
+        } else {
+            trimInfo.setText("FULL TAKE (" + fmtMs(durationMs) + ")");
+        }
         trimInfo.setTextColor(isTrimmed ? 0xFFFFB800 : 0xFFE0E0E0);
         trimInfo.setTextSize(12f);
         trimInfo.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
         trimCard.addView(trimInfo);
+
+        if (isTrimmed) {
+            LinearLayout modeRow = new LinearLayout(ctx);
+            modeRow.setOrientation(LinearLayout.HORIZONTAL);
+            LinearLayout.LayoutParams mlp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            mlp.topMargin = dp(8);
+            modeRow.addView(chip(ctx, "KEEP RANGE", !cutMiddle, () -> {
+                cutMiddle = false;
+                rebuild(ctx);
+            }), chipParams(true));
+            modeRow.addView(chip(ctx, "CUT OUT MIDDLE", cutMiddle, () -> {
+                cutMiddle = true;
+                rebuild(ctx);
+            }), chipParams(false));
+            trimCard.addView(modeRow, mlp);
+        }
 
         TextView trimBtn = pillBtn(ctx, isTrimmed ? "ADJUST TRIM HANDLES ON WAVEFORM" : "SET TRIM HANDLES ON WAVEFORM",
                 0xFFFFB800);
@@ -174,6 +209,16 @@ public final class EditExportDialog extends Dialog {
             if (listener != null) listener.onToggleWaveformTrim();
         });
         trimCard.addView(trimBtn, tlp);
+
+        // Fade In / Fade Out rows
+        trimCard.addView(fadeRow(ctx, "FADE IN", fadeInMs, v -> {
+            fadeInMs = v;
+            rebuild(ctx);
+        }));
+        trimCard.addView(fadeRow(ctx, "FADE OUT", fadeOutMs, v -> {
+            fadeOutMs = v;
+            rebuild(ctx);
+        }));
         body.addView(trimCard);
 
         // 2. DSP / Normalization
@@ -186,17 +231,26 @@ public final class EditExportDialog extends Dialog {
                     applyPresetDsp,
                     () -> {
                         applyPresetDsp = !applyPresetDsp;
-                        if (applyPresetDsp) applyNormOnly = false;
+                        if (applyPresetDsp) { applyNormOnly = false; applyLufsOnly = false; }
                         rebuild(ctx);
                     }));
         }
         body.addView(optionRow(ctx,
-                "True Peak Normalize Only (-1.0 dBFS)",
-                "Clean constant-gain lift without EQ or compression",
+                "True Peak Normalize (-1.0 dBFS)",
+                "Clean constant-gain peak lift without EQ or compression",
                 applyNormOnly,
                 () -> {
                     applyNormOnly = !applyNormOnly;
-                    if (applyNormOnly) applyPresetDsp = false;
+                    if (applyNormOnly) { applyPresetDsp = false; applyLufsOnly = false; }
+                    rebuild(ctx);
+                }));
+        body.addView(optionRow(ctx,
+                "Loudness Normalize (-16 LUFS)",
+                "BS.1770 podcast/streaming loudness with -1 dBFS peak safety cap",
+                applyLufsOnly,
+                () -> {
+                    applyLufsOnly = !applyLufsOnly;
+                    if (applyLufsOnly) { applyPresetDsp = false; applyNormOnly = false; }
                     rebuild(ctx);
                 }));
 
@@ -255,20 +309,11 @@ public final class EditExportDialog extends Dialog {
         ebg.setCornerRadius(dp(8));
         exportBtn.setBackground(ebg);
         exportBtn.setOnClickListener(v -> {
-            DspConfig chosen;
-            if (applyPresetDsp) {
-                chosen = activePreset.withAutoApply(true);
-            } else if (applyNormOnly) {
-                chosen = new DspConfig("Normalize", true, 0f,
-                        false, 0, new float[]{0, 0, 0, 0, 0},
-                        false, -18f, 4f, 10f, 120f, 0f,
-                        true, -1.0f);
-            } else {
-                chosen = DspConfig.rawBypass();
-            }
+            DspConfig chosen = resolveSelectedDsp();
             dismiss();
             if (listener != null) {
-                listener.onExportRequested(trimStartMs, trimEndMs, chosen, outFormat, bitrateKbps);
+                listener.onExportRequested(trimStartMs, trimEndMs, cutMiddle, fadeInMs, fadeOutMs,
+                        chosen, outFormat, bitrateKbps);
             }
         });
         LinearLayout.LayoutParams elp = new LinearLayout.LayoutParams(
@@ -276,9 +321,79 @@ public final class EditExportDialog extends Dialog {
         elp.topMargin = dp(22);
         body.addView(exportBtn, elp);
 
+        if (markerCount > 0) {
+            TextView splitBtn = new TextView(ctx);
+            splitBtn.setText("SPLIT AT " + markerCount + " MARKER" + (markerCount == 1 ? "" : "S")
+                    + " (" + (markerCount + 1) + " FILES)");
+            splitBtn.setTextColor(0xFFFFB800);
+            splitBtn.setTextSize(12f);
+            splitBtn.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
+            splitBtn.setGravity(Gravity.CENTER);
+            splitBtn.setPadding(dp(14), dp(12), dp(14), dp(12));
+            GradientDrawable sbg = new GradientDrawable();
+            sbg.setColor(0xFF0A0A0A);
+            sbg.setCornerRadius(dp(8));
+            sbg.setStroke(dp(1), 0xFFFFB800);
+            splitBtn.setBackground(sbg);
+            splitBtn.setOnClickListener(v -> {
+                DspConfig chosen = resolveSelectedDsp();
+                dismiss();
+                if (listener != null) {
+                    listener.onSplitAtMarkersRequested(fadeInMs, fadeOutMs, chosen, outFormat, bitrateKbps);
+                }
+            });
+            LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            slp.topMargin = dp(10);
+            body.addView(splitBtn, slp);
+        }
+
         scroll.addView(body);
         root.addView(scroll, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
         return root;
+    }
+
+    private DspConfig resolveSelectedDsp() {
+        if (applyPresetDsp) {
+            return activePreset.withAutoApply(true);
+        } else if (applyNormOnly) {
+            return new DspConfig("Normalize", true, 0f, 0, false, -45f,
+                    false, 0, new float[]{0, 0, 0, 0, 0},
+                    false, -18f, 4f, 10f, 120f, 0f,
+                    true, -1.0f, false);
+        } else if (applyLufsOnly) {
+            return new DspConfig("LUFS -16", true, 0f, 0, false, -45f,
+                    false, 0, new float[]{0, 0, 0, 0, 0},
+                    false, -18f, 4f, 10f, 120f, 0f,
+                    true, -16.0f, true);
+        }
+        return DspConfig.rawBypass();
+    }
+
+    private interface IntConsumer { void accept(int v); }
+
+    private View fadeRow(Context ctx, String label, int currentMs, IntConsumer onPick) {
+        LinearLayout row = new LinearLayout(ctx);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        rlp.topMargin = dp(10);
+        row.setLayoutParams(rlp);
+
+        TextView lbl = new TextView(ctx);
+        lbl.setText(label);
+        lbl.setTextColor(0xFF888888);
+        lbl.setTextSize(10f);
+        lbl.setTypeface(Typeface.MONOSPACE, Typeface.BOLD);
+        row.addView(lbl, new LinearLayout.LayoutParams(dp(64), ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        for (int i = 0; i < FADE_OPTIONS_MS.length; i++) {
+            final int ms = FADE_OPTIONS_MS[i];
+            row.addView(chip(ctx, FADE_LABELS[i], currentMs == ms, () -> onPick.accept(ms)),
+                    chipParams(i < FADE_OPTIONS_MS.length - 1));
+        }
+        return row;
     }
 
     private void rebuild(Context ctx) {

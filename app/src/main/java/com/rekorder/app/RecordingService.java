@@ -10,12 +10,18 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.media.AudioAttributes;
+import android.media.AudioDeviceInfo;
+import android.media.AudioFocusRequest;
 import android.media.AudioFormat;
+import android.media.AudioManager;
+import android.media.AudioRecordingConfiguration;
 import android.media.AudioTrack;
 import android.net.Uri;
 import android.os.Binder;
 import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.PowerManager;
 import android.os.Process;
 
@@ -80,6 +86,7 @@ public final class RecordingService extends Service {
     public static final String ACTION_STOP = "com.rekorder.app.ACTION_STOP";
     public static final String ACTION_TOGGLE_PAUSE = "com.rekorder.app.ACTION_TOGGLE_PAUSE";
     public static final String ACTION_START_DEFAULT = "com.rekorder.app.ACTION_START_DEFAULT";
+    public static final String ACTION_WIDGET_TOGGLE = "com.rekorder.app.ACTION_WIDGET_TOGGLE";
 
     private static final String CHANNEL_ID = "rekorder_capture";
     private static final int NOTIF_ID = 1001;
@@ -113,6 +120,8 @@ public final class RecordingService extends Service {
     private final AtomicBoolean pausedFlag = new AtomicBoolean(false);
     private final AtomicBoolean discardFlag = new AtomicBoolean(false);
     private final AtomicBoolean checkpointRequested = new AtomicBoolean(false);
+    private final AtomicBoolean autoPausedByInterrupt = new AtomicBoolean(false);
+    private volatile boolean voxWaiting = false;
     private volatile boolean isForegroundActive = false;
     private volatile String lastProcStage = "";
     private volatile String lastProcDetail = "";
@@ -121,6 +130,69 @@ public final class RecordingService extends Service {
     private Thread workerThread;
     private AudioCaptureEngine activeEngine;
     private PowerManager.WakeLock wakeLock;
+    private AudioManager audioManager;
+    private AudioFocusRequest recFocusRequest;
+    private boolean recordingCallbackRegistered = false;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+
+    private final AudioManager.OnAudioFocusChangeListener recFocusListener = focusChange -> {
+        if (state == State.RECORDING && (focusChange == AudioManager.AUDIOFOCUS_LOSS
+                || focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT)) {
+            if (autoPausedByInterrupt.compareAndSet(false, true)) {
+                pausedFlag.set(true);
+                checkpointRequested.set(true);
+                if (activeEngine != null) activeEngine.setPaused(true);
+                state = State.PAUSED;
+                updateForegroundNotification();
+                notifyState();
+                notifyWarning("Auto-paused for incoming call / audio interruption");
+            }
+        } else if (focusChange == AudioManager.AUDIOFOCUS_GAIN && state == State.PAUSED
+                && autoPausedByInterrupt.compareAndSet(true, false)) {
+            pausedFlag.set(false);
+            if (activeEngine != null) activeEngine.setPaused(false);
+            state = State.RECORDING;
+            updateForegroundNotification();
+            notifyState();
+            notifyWarning("Resumed recording after interruption");
+        }
+    };
+
+    private final AudioManager.AudioRecordingCallback recSilenceCallback =
+            new AudioManager.AudioRecordingCallback() {
+                @Override
+                public void onRecordingConfigChanged(List<AudioRecordingConfiguration> configs) {
+                    if (Build.VERSION.SDK_INT < 29 || configs == null) return;
+                    if (state != State.RECORDING && !(state == State.PAUSED && autoPausedByInterrupt.get())) {
+                        return;
+                    }
+                    boolean silenced = false;
+                    for (AudioRecordingConfiguration c : configs) {
+                        try {
+                            if (c.isClientSilenced()) {
+                                silenced = true;
+                                break;
+                            }
+                        } catch (Throwable ignored) {}
+                    }
+                    if (silenced && state == State.RECORDING && autoPausedByInterrupt.compareAndSet(false, true)) {
+                        pausedFlag.set(true);
+                        checkpointRequested.set(true);
+                        if (activeEngine != null) activeEngine.setPaused(true);
+                        state = State.PAUSED;
+                        updateForegroundNotification();
+                        notifyState();
+                        notifyWarning("Mic silenced by phone/VoIP call · auto-paused safely");
+                    } else if (!silenced && state == State.PAUSED && autoPausedByInterrupt.compareAndSet(true, false)) {
+                        pausedFlag.set(false);
+                        if (activeEngine != null) activeEngine.setPaused(false);
+                        state = State.RECORDING;
+                        updateForegroundNotification();
+                        notifyState();
+                        notifyWarning("Mic restored · resumed recording");
+                    }
+                }
+            };
 
     public final class LocalBinder extends Binder {
         public RecordingService getService() {
@@ -131,6 +203,7 @@ public final class RecordingService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
         ensureNotificationChannel();
     }
 
@@ -151,9 +224,19 @@ public final class RecordingService extends Service {
                 if (state == State.IDLE) {
                     startRecording(AudioConfig.load(this), DspPresetStore.loadActive(this));
                 }
+            } else if (ACTION_WIDGET_TOGGLE.equals(act)) {
+                if (state == State.IDLE) {
+                    startRecording(AudioConfig.load(this), DspPresetStore.loadActive(this));
+                } else if (state == State.RECORDING || state == State.PAUSED) {
+                    stopSession();
+                }
             }
         }
         return START_NOT_STICKY;
+    }
+
+    public boolean isVoxWaiting() {
+        return voxWaiting;
     }
 
     @Override
@@ -237,6 +320,7 @@ public final class RecordingService extends Service {
     }
 
     public synchronized void togglePause() {
+        autoPausedByInterrupt.set(false);
         if (state == State.RECORDING) {
             pausedFlag.set(true);
             checkpointRequested.set(true);
@@ -251,6 +335,51 @@ public final class RecordingService extends Service {
             promoteToForeground(getString(R.string.notif_recording), false);
             notifyState();
         }
+    }
+
+    private void updateForegroundNotification() {
+        if (!isForegroundActive) return;
+        boolean paused = (state == State.PAUSED);
+        promoteToForeground(getString(paused ? R.string.notif_paused : R.string.notif_recording), paused);
+    }
+
+    private void registerInterruptionGuards() {
+        if (audioManager == null) return;
+        try {
+            if (Build.VERSION.SDK_INT >= 26) {
+                recFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                        .setAudioAttributes(new AudioAttributes.Builder()
+                                .setUsage(AudioAttributes.USAGE_MEDIA)
+                                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                                .build())
+                        .setOnAudioFocusChangeListener(recFocusListener, mainHandler)
+                        .build();
+                audioManager.requestAudioFocus(recFocusRequest);
+            }
+        } catch (Throwable ignored) {}
+        try {
+            if (Build.VERSION.SDK_INT >= 29 && !recordingCallbackRegistered) {
+                audioManager.registerAudioRecordingCallback(recSilenceCallback, mainHandler);
+                recordingCallbackRegistered = true;
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private void unregisterInterruptionGuards() {
+        autoPausedByInterrupt.set(false);
+        if (audioManager == null) return;
+        try {
+            if (Build.VERSION.SDK_INT >= 26 && recFocusRequest != null) {
+                audioManager.abandonAudioFocusRequest(recFocusRequest);
+                recFocusRequest = null;
+            }
+        } catch (Throwable ignored) {}
+        try {
+            if (Build.VERSION.SDK_INT >= 29 && recordingCallbackRegistered) {
+                audioManager.unregisterAudioRecordingCallback(recSilenceCallback);
+                recordingCallbackRegistered = false;
+            }
+        } catch (Throwable ignored) {}
     }
 
     /**
@@ -428,8 +557,19 @@ public final class RecordingService extends Service {
         String savedNote = null;
         String sessionNotice = null;
         int wavPartIndex = 1;
+        boolean btMicActivated = false;
+        voxWaiting = false;
 
         try {
+            if (config.deviceId > 0) {
+                AudioDeviceInfo chosenIn = AudioDeviceHelper.findDeviceById(this, config.deviceId);
+                if (AudioDeviceHelper.isBluetoothInput(chosenIn)) {
+                    btMicActivated = AudioDeviceHelper.activateBluetoothMic(this, chosenIn);
+                }
+            }
+            if (writeToDisk) {
+                registerInterruptionGuards();
+            }
             OpenedEngine opened = openCaptureEngineWithFallback(config, false);
             engine = opened.engine;
             AudioCaptureEngine.StreamInfo info = opened.info;
@@ -460,9 +600,16 @@ public final class RecordingService extends Service {
             boolean isCompressed = activeFormat.isCompressed;
             boolean wantNormalize = writeToDisk && dspConfig.hasNormalizer();
             boolean useScratchForCompressedNorm = writeToDisk && isCompressed && wantNormalize;
+            DspChain.LufsMeter lufsMeter = (wantNormalize && dspConfig.normUseLufs)
+                    ? new DspChain.LufsMeter(sessionRate, sessionCh) : null;
+            final double voxLinearThresh = Math.pow(10.0, config.silenceThresholdDb / 20.0);
+            final long maxDurMs = (config.maxDurationMinutes > 0)
+                    ? (config.maxDurationMinutes * 60_000L) : 0L;
+            long voxSilentMs = 0L;
 
             if (writeToDisk) {
-                target = RecordingStorage.createTarget(this, activeFormat, sessionRate, sessionCh, "", false);
+                target = RecordingStorage.createTarget(this, config.filenamePrefix, activeFormat,
+                        sessionRate, sessionCh, "", false);
                 if (target.fellBackToDefault) {
                     notifyWarning("Custom folder unavailable · saving safely to App Storage");
                 }
@@ -485,7 +632,8 @@ public final class RecordingService extends Service {
                         target.deleteSilently(this);
                         activeFormat = AudioConfig.OutputFormat.WAV_24;
                         isCompressed = false;
-                        target = RecordingStorage.createTarget(this, activeFormat, sessionRate, sessionCh, "", false);
+                        target = RecordingStorage.createTarget(this, config.filenamePrefix, activeFormat,
+                                sessionRate, sessionCh, "", false);
                         savedUri = target.uri;
                         savedName = target.displayName;
                         wavWriter = new WavWriter(target.channel, activeFormat, sessionRate, sessionCh);
@@ -498,7 +646,8 @@ public final class RecordingService extends Service {
                         target.deleteSilently(this);
                         activeFormat = AudioConfig.OutputFormat.WAV_24;
                         isCompressed = false;
-                        target = RecordingStorage.createTarget(this, activeFormat, sessionRate, sessionCh, "", false);
+                        target = RecordingStorage.createTarget(this, config.filenamePrefix, activeFormat,
+                                sessionRate, sessionCh, "", false);
                         savedUri = target.uri;
                         savedName = target.displayName;
                         wavWriter = new WavWriter(target.channel, activeFormat, sessionRate, sessionCh);
@@ -513,7 +662,8 @@ public final class RecordingService extends Service {
                         try {
                             activeFormat = AudioConfig.OutputFormat.MP3;
                             isCompressed = true;
-                            target = RecordingStorage.createTarget(this, activeFormat, sessionRate, sessionCh, "", false);
+                            target = RecordingStorage.createTarget(this, config.filenamePrefix, activeFormat,
+                                    sessionRate, sessionCh, "", false);
                             savedUri = target.uri;
                             savedName = target.displayName;
                             mp3Writer = new Mp3FileWriter(target.channel, sessionRate, sessionCh,
@@ -698,7 +848,8 @@ public final class RecordingService extends Service {
 
                 boolean needAdapt = (curHwCh != sessionCh) || (reconnectResampler != null);
                 boolean needFloatPath = needAdapt || activeDspConfig.hasRealTimeFx()
-                        || isCompressed || useScratchForCompressedNorm || (monitorTrack != null);
+                        || isCompressed || useScratchForCompressedNorm || (monitorTrack != null)
+                        || (lufsMeter != null);
                 float grDb = 0f;
                 int frames;
 
@@ -735,9 +886,29 @@ public final class RecordingService extends Service {
                         workingFloat.clear();
                     }
 
-                    if (writeToDisk && !pausedFlag.get()) {
+                    boolean skipThisBlock = false;
+                    if (writeToDisk && !pausedFlag.get() && config.silenceSkipEnabled) {
+                        long blkMs = (frames * 1000L) / Math.max(1, sessionRate);
+                        if (meter.peak < voxLinearThresh) {
+                            voxSilentMs += blkMs;
+                            if (voxSilentMs >= 1500L) {
+                                skipThisBlock = true;
+                                voxWaiting = true;
+                            }
+                        } else {
+                            voxSilentMs = 0L;
+                            voxWaiting = false;
+                        }
+                    } else {
+                        voxWaiting = false;
+                    }
+
+                    if (writeToDisk && !pausedFlag.get() && !skipThisBlock) {
                         if (Float.isFinite(meter.peak) && meter.peak > sessionMaxPeak) {
                             sessionMaxPeak = meter.peak;
+                        }
+                        if (lufsMeter != null) {
+                            lufsMeter.feedInterleavedFloat(workingFloat, frames);
                         }
                         try {
                             if (useScratchForCompressedNorm && scratchChannel != null) {
@@ -813,7 +984,23 @@ public final class RecordingService extends Service {
                 } else {
                     frames = hwFrames;
                     PcmConverter.computeMeter(rawBuf, hwFrames * curHwBpf, curHwFmt, sessionCh, meter);
-                    if (writeToDisk && wavWriter != null && !pausedFlag.get()) {
+                    boolean skipThisBlock = false;
+                    if (writeToDisk && !pausedFlag.get() && config.silenceSkipEnabled) {
+                        long blkMs = (frames * 1000L) / Math.max(1, sessionRate);
+                        if (meter.peak < voxLinearThresh) {
+                            voxSilentMs += blkMs;
+                            if (voxSilentMs >= 1500L) {
+                                skipThisBlock = true;
+                                voxWaiting = true;
+                            }
+                        } else {
+                            voxSilentMs = 0L;
+                            voxWaiting = false;
+                        }
+                    } else {
+                        voxWaiting = false;
+                    }
+                    if (writeToDisk && wavWriter != null && !pausedFlag.get() && !skipThisBlock) {
                         if (Float.isFinite(meter.peak) && meter.peak > sessionMaxPeak) {
                             sessionMaxPeak = meter.peak;
                         }
@@ -830,6 +1017,13 @@ public final class RecordingService extends Service {
                             break;
                         }
                     }
+                }
+
+                // Max-duration auto-stop timer
+                if (writeToDisk && maxDurMs > 0L && currentElapsedMs >= maxDurMs) {
+                    sessionNotice = "Auto-stopped at " + config.maxDurationMinutes + " min timer";
+                    notifyWarning(sessionNotice);
+                    break;
                 }
 
                 // Automatic seamless WAV part-splitting before the 4 GiB RIFF ceiling!
@@ -944,8 +1138,10 @@ public final class RecordingService extends Service {
                         savedUri = null;
                         savedBytes = 0L;
                     } else {
-                        float estGain = DspChain.computeNormalizeGain(sessionMaxPeak, dspConfig.normTargetDb);
-                        float estDb = (sessionMaxPeak > 1e-6f) ? (float) (20.0 * Math.log10(estGain)) : 0f;
+                        float estGain = (lufsMeter != null)
+                                ? DspChain.computeLufsGain(lufsMeter.getIntegratedLufs(), dspConfig.normTargetDb, sessionMaxPeak)
+                                : DspChain.computeNormalizeGain(sessionMaxPeak, dspConfig.normTargetDb);
+                        float estDb = (estGain > 1e-6f) ? (float) (20.0 * Math.log10(estGain)) : 0f;
                         String fmtTag = activeFormat.usesBitrate
                                 ? (activeFormat.shortLabel + " " + config.compressedBitrateKbps + "k")
                                 : activeFormat.shortLabel;
@@ -954,10 +1150,10 @@ public final class RecordingService extends Service {
                         long procStartMs = System.currentTimeMillis();
 
                         try {
-                            float appliedDb = PostNormalizer.normalizeAndEncodeCompressed(
+                            float appliedDb = PostNormalizer.normalizeAndEncodeCompressedByGain(
                                     scratchFile, target.channel, activeFormat,
                                     sessionRate, sessionCh, config.compressedBitrateKbps,
-                                    sessionMaxPeak, dspConfig.normTargetDb,
+                                    estGain,
                                     (done, total, pct) -> {
                                         String eta = formatEta(procStartMs, done, total);
                                         String detail = RecordingStorage.formatBytes(done) + " / "
@@ -968,9 +1164,10 @@ public final class RecordingService extends Service {
                             savedBytes = target.channel.size();
                             if (savedBytes > 0L) {
                                 scratchSafelySaved = true;
+                                String unit = dspConfig.normUseLufs ? "LUFS" : "dBFS";
                                 savedNote = combineNotes(
-                                        String.format(Locale.US, "Normalized %+.1f dB -> %.1f dBFS",
-                                                appliedDb, dspConfig.normTargetDb),
+                                        String.format(Locale.US, "Normalized %+.1f dB -> %.1f %s",
+                                                appliedDb, dspConfig.normTargetDb, unit),
                                         sessionNotice);
                             }
                         } catch (Throwable primaryErr) {
@@ -1081,29 +1278,32 @@ public final class RecordingService extends Service {
                     savedNote = sessionNotice;
 
                     if (wantNormalize && wavWriter.getDataBytesWritten() > 0L) {
-                        float estGain = DspChain.computeNormalizeGain(sessionMaxPeak, dspConfig.normTargetDb);
-                        float estDb = (sessionMaxPeak > 1e-6f) ? (float) (20.0 * Math.log10(estGain)) : 0f;
+                        float estGain = (lufsMeter != null)
+                                ? DspChain.computeLufsGain(lufsMeter.getIntegratedLufs(), dspConfig.normTargetDb, sessionMaxPeak)
+                                : DspChain.computeNormalizeGain(sessionMaxPeak, dspConfig.normTargetDb);
+                        float estDb = (estGain > 1e-6f) ? (float) (20.0 * Math.log10(estGain)) : 0f;
+                        String unit = dspConfig.normUseLufs ? "LUFS" : "dBFS";
                         String stageTitle = String.format(Locale.US, "NORMALIZING %s (%+.1f dB)",
                                 activeFormat.shortLabel, estDb);
                         long procStartMs = System.currentTimeMillis();
                         long dataOff = WavWriter.headerSize(activeFormat);
                         try (RecordingStorage.ReadableChannelHandle rh = target.openReadChannel(this)) {
-                            float appliedDb = PostNormalizer.normalizePcmInPlace(
+                            float appliedDb = PostNormalizer.normalizePcmInPlaceByGain(
                                     rh.channel, target.channel, activeFormat,
                                     dataOff, wavWriter.getDataBytesWritten(),
-                                    sessionMaxPeak, dspConfig.normTargetDb,
+                                    estGain,
                                     (done, total, pct) -> {
                                         String eta = formatEta(procStartMs, done, total);
                                         String detail = RecordingStorage.formatBytes(done) + " / "
                                                 + RecordingStorage.formatBytes(total)
-                                                + String.format(Locale.US, "  ·  target %.1f dBFS", dspConfig.normTargetDb)
+                                                + String.format(Locale.US, "  ·  target %.1f %s", dspConfig.normTargetDb, unit)
                                                 + (eta.isEmpty() ? "" : "  ·  " + eta);
                                         notifyProcessing(stageTitle, detail, pct);
                                     });
                             if (Math.abs(appliedDb) >= 0.1f) {
                                 savedNote = combineNotes(
-                                        String.format(Locale.US, "Normalized %+.1f dB -> %.1f dBFS",
-                                                appliedDb, dspConfig.normTargetDb),
+                                        String.format(Locale.US, "Normalized %+.1f dB -> %.1f %s",
+                                                appliedDb, dspConfig.normTargetDb, unit),
                                         sessionNotice);
                             }
                         } catch (Throwable normErr) {
@@ -1118,6 +1318,11 @@ public final class RecordingService extends Service {
             String msg = t.getMessage() != null ? t.getMessage() : t.getClass().getSimpleName();
             notifyError(msg);
         } finally {
+            voxWaiting = false;
+            unregisterInterruptionGuards();
+            if (btMicActivated) {
+                AudioDeviceHelper.deactivateBluetoothMic(this);
+            }
             if (monitorTrack != null) {
                 try { monitorTrack.stop(); } catch (IllegalStateException ignored) {}
                 monitorTrack.release();
@@ -1241,6 +1446,7 @@ public final class RecordingService extends Service {
     private void notifyState() {
         Callback cb = callback;
         if (cb != null) cb.onStateChanged(state, activeStreamInfo, activeConfig);
+        RekorderWidgetProvider.requestUpdate(this);
     }
 
     private void notifySaved(Uri uri, String fileName, long fileBytes, String note) {

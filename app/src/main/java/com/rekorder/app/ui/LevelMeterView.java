@@ -28,6 +28,7 @@ public final class LevelMeterView extends View {
     private float gainReductionDb = 0f;
     private boolean clippedLatch = false;
     private int totalClips = 0;
+    private int clipBaseline = 0;
 
     private final Paint trackPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint barPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -66,6 +67,18 @@ public final class LevelMeterView extends View {
         valuePaint.setTextSize(10.5f * dp);
         valuePaint.setTypeface(Typeface.MONOSPACE);
         valuePaint.setTextAlign(Paint.Align.RIGHT);
+
+        setClickable(true);
+        setOnClickListener(v -> clearClipLatch());
+    }
+
+    public void clearClipLatch() {
+        if (clippedLatch || totalClips > 0) {
+            clipBaseline += totalClips;
+            totalClips = 0;
+            clippedLatch = false;
+            invalidate();
+        }
     }
 
     public void reset() {
@@ -75,6 +88,7 @@ public final class LevelMeterView extends View {
         gainReductionDb = 0f;
         clippedLatch = false;
         totalClips = 0;
+        clipBaseline = 0;
         invalidate();
     }
 
@@ -131,9 +145,10 @@ public final class LevelMeterView extends View {
             gainReductionDb = Math.min(0f, gainReductionDb + 0.6f);
         }
 
-        if (clippedNow || clipCountTotal > 0) {
+        int effClips = Math.max(0, clipCountTotal - clipBaseline);
+        if (clippedNow || effClips > 0) {
             clippedLatch = true;
-            totalClips = clipCountTotal;
+            totalClips = effClips;
         }
         postInvalidateOnAnimation();
     }

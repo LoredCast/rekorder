@@ -1,6 +1,6 @@
 # Rekorder
 
-Ultra-small (**~359 KB**), zero-dependency, pitch-black (`#000000`) AMOLED Android audio recorder engineered for **raw, lossless, unprocessed audio capture** from built-in microphones or USB audio interfaces, with built-in **WAV**, **FLAC**, **OGG Opus**, **MP3**, **RAW PCM**, a studio **Preamp + EQ + Compressor + Normalizer** DSP chain, **independent input & output routing**, non-destructive **Trim & Export**, and crash-safe long-take reliability.
+Ultra-small (**~391 KB**), zero-dependency, pitch-black (`#000000`) AMOLED Android audio recorder engineered for **raw, lossless, unprocessed audio capture** from built-in microphones, Bluetooth headsets, or USB audio interfaces, with built-in **WAV**, **FLAC**, **OGG Opus**, **MP3**, **RAW PCM**, a studio **Preamp + De-Hum + Noise Gate + EQ + Compressor + Peak/LUFS Normalizer** DSP chain, **independent input & output routing**, live playback FX auditioning, non-destructive **Trim / Cut / Fade / Split-at-Markers**, and crash-safe long-take reliability.
 
 - **License:** [GNU GPL v3.0 or later](LICENSE) (`GPL-3.0-or-later`)
 - **Privacy:** 100% offline
@@ -22,18 +22,18 @@ Ultra-small (**~359 KB**), zero-dependency, pitch-black (`#000000`) AMOLED Andro
   - Select your recording input (e.g. USB condenser mic) completely independently from playback/monitoring output (e.g. **Phone Speaker** or **Wired Headphones**).
   - Persists output selection by both device ID and type across reboots and USB hot-plug events so plugging in a USB mic never hijacks speaker output.
 - **Studio DSP Chain & Auto-Apply Presets**:
-  - **Input Preamp Gain** (`-12 dB` to `+24 dB`)
+  - **Input Preamp Gain** (`-12 dB` to `+24 dB`), **50/60 Hz De-Hum Mains Notch** (+ 2nd harmonic), and **Soft Noise Gate**
   - **High-Pass Filter + 5-Band Equalizer** (`80/120 Hz` Butterworth HPF + `80Hz / 250Hz / 1kHz / 4kHz / 10kHz`, `±12 dB`, 64-bit internal biquad precision)
   - **Soft-Knee Feed-Forward Compressor** (Threshold, Ratio, Attack, Release, Makeup Gain, stereo-linked detection, live `GR dB` telemetry)
-  - **Exact 2-Pass True Peak Normalizer** (`-0.5 / -1.0 / -3.0 / -6.0 dBFS`) with live non-blocking progress UI
-  - **Presets & Auto-Apply**: 5 built-in presets + custom saved presets and persistent `AUTO-APPLY ON RECORD` toggle (when off, capture remains 100% bit-exact untouched PCM)
-- **Long-Take Reliability & Crash Safety**:
-  - 15-second crash-safe WAV header checkpointing and automatic 4 GiB seamless multi-part WAV splitting (`_part2.wav`).
-  - Automatic startup recovery of interrupted scratch takes into lossless `_recovered.wav` files.
-  - Multi-tier encoder fallback rescuing audio to lossless WAV if a hardware codec ever fails, plus low-storage guards.
-- **AMOLED UI, Trim/Export & Background Playback**:
-  - Pure `#000000` edge-to-edge UI, dual L/R stereo level meters, live `+ MARK` recording bookmarks, `DISCARD TAKE` while paused, live headphone-only monitoring, Quick Settings Record Tile, and custom SAF storage folder.
-  - Interactive waveform preview with up to `32x` horizontal pinch-zoom/pan, binary `WaveformCache`, Search/Duration/Rename in Recordings, and non-destructive offline **Trim / Post-Hoc DSP / Format Export**.
+  - **Exact 2-Pass True Peak (`-0.5..-6 dBFS`) or ITU-R BS.1770 Integrated Loudness (`-14..-23 LUFS`) Normalizer** with `-1 dBFS` peak safety cap
+  - **Presets, JSON Backup & Live Auditioning**: 5 built-in presets, custom saved presets, JSON clipboard export/import, persistent `AUTO-APPLY ON RECORD` toggle, and live `FX` auditioning during playback
+- **Long-Take Reliability & Hardware Controls**:
+  - Automatic pause & resume on incoming phone/VoIP calls (`AudioFocus` + silenced-mic detection), Bluetooth HFP/SCO mic activation, and tap-to-reset `CLIP` counter latch.
+  - Optional **Silence Skip (VOX)**, **Auto-Stop Max-Duration Timer**, custom **Filename Prefix**, and **Hardware Volume-Button Trigger** (`Vol Up` Rec/Pause, `Vol Down` `+ MARK`).
+  - 15-second crash-safe WAV header checkpointing, automatic 4 GiB seamless multi-part WAV splitting (`_part2.wav`), orphaned scratch auto-recovery, multi-tier encoder fallback, and low-storage guards.
+- **AMOLED UI, Editing, System Integration & Background Playback**:
+  - Pure `#000000` adaptive Portrait/Landscape UI, dual L/R stereo meters, Quick Settings Record Tile, Launcher Quick-Record Shortcut, 1×1 Home Screen Record Widget, and **"Open With"** external audio support (`ACTION_VIEW` / `ACTION_SEND`).
+  - Interactive waveform preview (`32x` pinch-zoom/pan, binary `WaveformCache`), `<MK / +MK / MK>` marker navigation & naming, **A–B Trim Loop**, Recordings Search/Sort/Batch Multi-Select Share & Delete, and non-destructive offline **Trim / Cut-Out Middle / Fade-In & Fade-Out / Split-at-Markers / DSP / Format Export**.
   - Full background `PlaybackService` with lock-screen `MediaSession` controls (`-10s` / Play-Pause / `+10s`), `0.5x–2.0x` playback speed, and audio focus handling.
 
 ## Reproducible Build & Install

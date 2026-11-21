@@ -260,6 +260,69 @@ public final class AudioDeviceHelper {
         return resolveSafeMonitorOutput(ctx, 0, 0) != null;
     }
 
+    public static boolean isBluetoothInput(AudioDeviceInfo d) {
+        if (d == null) return false;
+        int t = d.getType();
+        return t == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+                || (Build.VERSION.SDK_INT >= 31 && t == AudioDeviceInfo.TYPE_BLE_HEADSET);
+    }
+
+    /**
+     * Activates Bluetooth HFP/SCO or BLE Headset mic routing before capture opens.
+     * Uses setCommunicationDevice() on API 31+ and startBluetoothSco() on API 26-30.
+     * Returns true if Bluetooth routing was activated and must be cleared on stop.
+     */
+    @SuppressWarnings("deprecation")
+    public static boolean activateBluetoothMic(Context ctx, AudioDeviceInfo inputDev) {
+        if (ctx == null || !isBluetoothInput(inputDev)) return false;
+        AudioManager am = (AudioManager) ctx.getSystemService(Context.AUDIO_SERVICE);
+        if (am == null) return false;
+        try {
+            if (Build.VERSION.SDK_INT >= 31) {
+                // Find matching communication device (SCO / BLE headset)
+                AudioDeviceInfo match = null;
+                for (AudioDeviceInfo c : am.getAvailableCommunicationDevices()) {
+                    if (c.getType() == inputDev.getType()) {
+                        match = c;
+                        if (c.getAddress() != null && c.getAddress().equals(inputDev.getAddress())) {
+                            break;
+                        }
+                    }
+                }
+                if (match != null && am.setCommunicationDevice(match)) {
+                    try { Thread.sleep(250); } catch (InterruptedException ignored) {}
+                    return true;
+                }
+            } else {
+                am.setMode(AudioManager.MODE_IN_COMMUNICATION);
+                am.startBluetoothSco();
+                am.setBluetoothScoOn(true);
+                try { Thread.sleep(400); } catch (InterruptedException ignored) {}
+                return true;
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
+    /** Cleanly tears down Bluetooth HFP/SCO mic routing after recording stops. */
+    @SuppressWarnings("deprecation")
+    public static void deactivateBluetoothMic(Context ctx) {
+        if (ctx == null) return;
+        AudioManager am = (AudioManager) ctx.getSystemService(Context.AUDIO_SERVICE);
+        if (am == null) return;
+        try {
+            if (Build.VERSION.SDK_INT >= 31) {
+                am.clearCommunicationDevice();
+            } else {
+                am.setBluetoothScoOn(false);
+                am.stopBluetoothSco();
+                am.setMode(AudioManager.MODE_NORMAL);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
     public static String describeOutputType(int type) {
         switch (type) {
             case AudioDeviceInfo.TYPE_BUILTIN_SPEAKER:  return "Phone Speaker";

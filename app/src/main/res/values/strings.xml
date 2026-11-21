@@ -6,4 +6,7 @@
     <string name="notif_recording">Recording raw audio</string>
     <string name="notif_paused">Recording paused</string>
     <string name="notif_stop">Stop</string>
+    <string name="shortcut_record_short">Record</string>
+    <string name="shortcut_record_long">Start Recording</string>
+    <string name="widget_name">Rekorder Record</string>
 </resources>

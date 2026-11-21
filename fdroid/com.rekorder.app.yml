@@ -18,8 +18,16 @@ Builds:
     build:
       - ANDROID_NDK_HOME=$$NDK$$ ./build.sh --unsigned
 
+  - versionName: 1.1.0
+    versionCode: 2
+    commit: v1.1.0
+    ndk: r27c
+    output: build/rekorder-unsigned.apk
+    build:
+      - ANDROID_NDK_HOME=$$NDK$$ ./build.sh --unsigned
+
 AutoUpdateMode: Version
 UpdateCheckMode: Tags
 UpdateCheckData: app/src/main/AndroidManifest.xml|android:versionCode="(\d+)"|.|android:versionName="([^"]+)"
-CurrentVersion: 1.0.0
-CurrentVersionCode: 1
+CurrentVersion: 1.1.0
+CurrentVersionCode: 2

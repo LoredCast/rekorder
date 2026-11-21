@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 package com.rekorder.app.ui;
 
+import android.app.AlertDialog;
 import android.app.Dialog;
 import android.content.Context;
 import android.content.Intent;
@@ -9,12 +10,14 @@ import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
 import android.os.PowerManager;
 import android.provider.Settings;
+import android.text.InputType;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.Window;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
+import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -51,6 +54,11 @@ public final class SettingsSheetDialog extends Dialog {
     private final int visualGain;
     private int compressedBitrateKbps;
     private boolean headphoneMonitor;
+    private boolean silenceSkipEnabled;
+    private int silenceThresholdDb;
+    private int maxDurationMinutes;
+    private String filenamePrefix;
+    private boolean volumeKeyTrigger;
 
     private final Listener listener;
     private final float dp;
@@ -72,6 +80,11 @@ public final class SettingsSheetDialog extends Dialog {
         this.visualGain = current.visualGain;
         this.compressedBitrateKbps = current.compressedBitrateKbps;
         this.headphoneMonitor = current.headphoneMonitor;
+        this.silenceSkipEnabled = current.silenceSkipEnabled;
+        this.silenceThresholdDb = current.silenceThresholdDb;
+        this.maxDurationMinutes = current.maxDurationMinutes;
+        this.filenamePrefix = current.filenamePrefix;
+        this.volumeKeyTrigger = current.volumeKeyTrigger;
 
         requestWindowFeature(Window.FEATURE_NO_TITLE);
         setContentView(buildContent(ctx));
@@ -296,6 +309,57 @@ public final class SettingsSheetDialog extends Dialog {
                     } catch (Exception ignored) {}
                 }));
 
+        body.addView(optionRow(ctx, "Hardware Volume-Button Trigger",
+                "Vol Up toggles Record/Pause · Vol Down drops + MARK while recording",
+                volumeKeyTrigger, () -> {
+                    volumeKeyTrigger = !volumeKeyTrigger;
+                    emitAndRebuild(ctx, root);
+                }));
+
+        body.addView(optionRow(ctx, "Silence Skip (VOX)",
+                silenceSkipEnabled
+                        ? "Skips dead air after 1.5s below " + silenceThresholdDb + " dBFS"
+                        : "Off · records continuously including silence",
+                silenceSkipEnabled, () -> {
+                    silenceSkipEnabled = !silenceSkipEnabled;
+                    emitAndRebuild(ctx, root);
+                }));
+        if (silenceSkipEnabled) {
+            LinearLayout voxRow = new LinearLayout(ctx);
+            voxRow.setOrientation(LinearLayout.HORIZONTAL);
+            LinearLayout.LayoutParams vlp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            vlp.bottomMargin = dp(8);
+            for (int i = 0; i < AudioConfig.SILENCE_THRESH_OPTIONS_DB.length; i++) {
+                final int db = AudioConfig.SILENCE_THRESH_OPTIONS_DB[i];
+                voxRow.addView(chip(ctx, db + " dB", silenceThresholdDb == db, () -> {
+                    silenceThresholdDb = db;
+                    emitAndRebuild(ctx, root);
+                }), chipParams(i < AudioConfig.SILENCE_THRESH_OPTIONS_DB.length - 1));
+            }
+            body.addView(voxRow, vlp);
+        }
+
+        // Auto-Stop Timer
+        body.addView(sectionLabel(ctx, "AUTO-STOP TIMER (MAX DURATION)"));
+        LinearLayout tmrRow = new LinearLayout(ctx);
+        tmrRow.setOrientation(LinearLayout.HORIZONTAL);
+        for (int i = 0; i < AudioConfig.MAX_DURATION_OPTIONS_MIN.length; i++) {
+            final int mins = AudioConfig.MAX_DURATION_OPTIONS_MIN[i];
+            String lbl = (mins == 0) ? "OFF" : (mins + "m");
+            tmrRow.addView(chip(ctx, lbl, maxDurationMinutes == mins, () -> {
+                maxDurationMinutes = mins;
+                emitAndRebuild(ctx, root);
+            }), chipParams(i < AudioConfig.MAX_DURATION_OPTIONS_MIN.length - 1));
+        }
+        body.addView(tmrRow);
+
+        // Filename Prefix
+        body.addView(sectionLabel(ctx, "FILENAME PREFIX"));
+        body.addView(optionRow(ctx, "Prefix: " + filenamePrefix + "_YYYYMMDD_HHMMSS",
+                "Tap to customize filename prefix (e.g. podcast, lecture, memo)",
+                !"rek".equals(filenamePrefix), () -> promptFilenamePrefix(ctx, root)));
+
         // 9. Hardware Diagnostics
         body.addView(sectionLabel(ctx, "HARDWARE HAL DIAGNOSTICS"));
         AudioDeviceHelper.HalDiagnostics diag = AudioDeviceHelper.probeHal(ctx);
@@ -359,7 +423,9 @@ public final class SettingsSheetDialog extends Dialog {
         AudioConfig updated = new AudioConfig(
                 engineMode, inputPreset, outputFormat, sampleRate,
                 channelCount, deviceId, keepScreenOn, visualGain, compressedBitrateKbps,
-                headphoneMonitor, outputDeviceId, outputDeviceType
+                headphoneMonitor, outputDeviceId, outputDeviceType,
+                silenceSkipEnabled, silenceThresholdDb, maxDurationMinutes,
+                filenamePrefix, volumeKeyTrigger
         );
         if (listener != null) {
             listener.onConfigUpdated(updated);
@@ -387,6 +453,29 @@ public final class SettingsSheetDialog extends Dialog {
                 }
             }
         }
+    }
+
+    private void promptFilenamePrefix(Context ctx, LinearLayout root) {
+        EditText input = new EditText(ctx);
+        input.setInputType(InputType.TYPE_CLASS_TEXT);
+        input.setText(filenamePrefix);
+        input.setSelection(filenamePrefix.length());
+        input.setHint("rek");
+        input.setTextColor(0xFFF2F2F2);
+        input.setHintTextColor(0xFF666666);
+        LinearLayout wrap = new LinearLayout(ctx);
+        wrap.setPadding(dp(18), dp(10), dp(18), dp(4));
+        wrap.addView(input, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        new AlertDialog.Builder(ctx, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setTitle("Filename Prefix")
+                .setView(wrap)
+                .setPositiveButton("Save", (d, w) -> {
+                    filenamePrefix = AudioConfig.sanitizePrefix(input.getText().toString());
+                    emitAndRebuild(ctx, root);
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
     }
 
     private static boolean isBatteryUnrestricted(Context ctx) {
