@@ -60,10 +60,8 @@ clang -O2 -Wall -Wextra -Inative tests/test_spsc_ring.c -lpthread -o /tmp/test_s
 clang -O2 -Wall -Wextra -Inative native/mp3_encoder.c tests/test_mp3_encoder.c -lm -o /tmp/test_mp3_encoder && /tmp/test_mp3_encoder
 
 # Host JVM tests (DSP, PCM, WAV, Ogg Opus, Normalizer, Resampler)
+./build.sh --unsigned
 mkdir -p /tmp/rek_tests
-javac -classpath "$ANDROID_HOME/platforms/android-35/android.jar" -d /tmp/rek_tests \
-  app/src/main/java/com/rekorder/app/audio/*.java \
-  app/src/main/java/com/rekorder/app/dsp/*.java \
-  tests/HostUnitTests.java
-java -cp "/tmp/rek_tests:$ANDROID_HOME/platforms/android-35/android.jar" HostUnitTests
+javac -cp "$ANDROID_HOME/platforms/android-35/android.jar:build/obj" -d /tmp/rek_tests tests/HostUnitTests.java
+java -cp "/tmp/rek_tests:build/obj:$ANDROID_HOME/platforms/android-35/android.jar" HostUnitTests
 ```

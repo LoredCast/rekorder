@@ -7,7 +7,7 @@ BUILD_DIR="$ROOT_DIR/build"
 APP_MAIN="$ROOT_DIR/app/src/main"
 MANIFEST="$APP_MAIN/AndroidManifest.xml"
 OUT_UNSIGNED_APK="$BUILD_DIR/rekorder-unsigned.apk"
-OUT_APK="$BUILD_DIR/rekorder.apk"
+OUT_APK="${OUT_APK:-$BUILD_DIR/rekorder.apk}"
 
 UNSIGNED_ONLY=0
 for arg in "$@"; do
@@ -73,8 +73,12 @@ if ! command -v readelf >/dev/null 2>&1 && command -v llvm-readelf >/dev/null 2>
     READELF_BIN="llvm-readelf"
 fi
 
-# Pick newest installed build-tools & android-35/36 platform
-BUILD_TOOLS_VER="$(ls -1 "$SDK_DIR/build-tools" | sort -V | tail -n 1)"
+# Pick pinned or newest installed build-tools & android-35/newest platform
+if [[ -n "${ANDROID_BUILD_TOOLS_VERSION:-}" && -d "$SDK_DIR/build-tools/$ANDROID_BUILD_TOOLS_VERSION" ]]; then
+    BUILD_TOOLS_VER="$ANDROID_BUILD_TOOLS_VERSION"
+else
+    BUILD_TOOLS_VER="$(ls -1 "$SDK_DIR/build-tools" | sort -V | tail -n 1)"
+fi
 BUILD_TOOLS="$SDK_DIR/build-tools/$BUILD_TOOLS_VER"
 if [[ -f "$SDK_DIR/platforms/android-35/android.jar" ]]; then
     PLATFORM_JAR="$SDK_DIR/platforms/android-35/android.jar"
@@ -258,31 +262,43 @@ if [[ "$UNSIGNED_ONLY" -eq 1 ]]; then
     exit 0
 fi
 
-# 10. Sign APK (reuses local debug keystore if present; auto-generates otherwise)
-KEYSTORE="$BUILD_DIR/debug.keystore"
-if [[ ! -f "$KEYSTORE" ]]; then
-    echo "==> Generating local debug signing keystore..."
-    keytool -genkeypair -v \
-        -keystore "$KEYSTORE" \
-        -storepass android \
-        -keypass android \
-        -alias rekorder \
-        -keyalg RSA \
-        -keysize 2048 \
-        -validity 10000 \
-        -dname "CN=Rekorder,O=Local,C=US" >/dev/null 2>&1
+# 10. Sign APK (uses RELEASE_KEYSTORE env vars if set; else reuses/generates local debug.keystore)
+if [[ -n "${RELEASE_KEYSTORE:-}" ]]; then
+    KEYSTORE="$RELEASE_KEYSTORE"
+    KEY_ALIAS="${RELEASE_KEY_ALIAS:-rekorder}"
+    export REKORDER_STORE_PASS="${RELEASE_STORE_PASS:?ERROR: RELEASE_STORE_PASS must be set when RELEASE_KEYSTORE is used}"
+    export REKORDER_KEY_PASS="${RELEASE_KEY_PASS:-$REKORDER_STORE_PASS}"
+    echo "==> Signing release APK with $KEYSTORE (alias: $KEY_ALIAS)..."
+else
+    KEYSTORE="$BUILD_DIR/debug.keystore"
+    KEY_ALIAS="rekorder"
+    export REKORDER_STORE_PASS="android"
+    export REKORDER_KEY_PASS="android"
+    if [[ ! -f "$KEYSTORE" ]]; then
+        echo "==> Generating local debug signing keystore..."
+        keytool -genkeypair -v \
+            -keystore "$KEYSTORE" \
+            -storepass:env REKORDER_STORE_PASS \
+            -keypass:env REKORDER_KEY_PASS \
+            -alias "$KEY_ALIAS" \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=Rekorder,O=Local,C=US" >/dev/null 2>&1
+    fi
+    echo "==> Signing local debug APK..."
 fi
 
-echo "==> Signing APK..."
 "$APKSIGNER" sign \
     --ks "$KEYSTORE" \
-    --ks-key-alias rekorder \
-    --ks-pass pass:android \
-    --key-pass pass:android \
+    --ks-key-alias "$KEY_ALIAS" \
+    --ks-pass env:REKORDER_STORE_PASS \
+    --key-pass env:REKORDER_KEY_PASS \
     --out "$OUT_APK" \
     "$OUT_UNSIGNED_APK"
 
 "$APKSIGNER" verify --verbose "$OUT_APK" >/dev/null
+unset REKORDER_STORE_PASS REKORDER_KEY_PASS
 
 echo ""
 echo "BUILD SUCCEEDED: $OUT_APK"

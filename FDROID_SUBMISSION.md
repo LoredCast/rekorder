@@ -12,21 +12,45 @@ This repository is prepared to satisfy the [F-Droid Inclusion Policy](https://f-
 
 ---
 
-## Step 1 — Push to GitHub (`loredcast/rekorder`) and Tag `v1.0.0`
+## Step 1 — Configure Automatic GitHub Release Signing (One-Time)
 
-Create an empty public repository named `rekorder` under `https://github.com/loredcast`, then push `main` and the `v1.0.0` release tag:
+This repo includes [`.github/workflows/release.yml`](.github/workflows/release.yml), which automatically tests, builds, signs, and publishes `rekorder-vX.Y.Z.apk` + `SHA256SUMS.txt` on GitHub Releases whenever you push a `v*` tag.
+
+1. Generate your permanent release keystore **outside** the repo and back it up safely:
+   ```bash
+   mkdir -p ~/.keys
+   keytool -genkeypair -v \
+     -keystore ~/.keys/rekorder-release.keystore \
+     -alias rekorder \
+     -keyalg RSA -keysize 4096 -validity 10000 \
+     -dname "CN=Rekorder, O=loredcast"
+   ```
+2. Base64-encode the keystore to copy into GitHub Secrets:
+   ```bash
+   base64 -w 0 ~/.keys/rekorder-release.keystore
+   ```
+3. In your GitHub repo (`https://github.com/loredcast/rekorder/settings/secrets/actions`), add these 4 **Repository secrets**:
+   - `RELEASE_KEYSTORE_BASE64` — base64 output from step 2
+   - `RELEASE_KEY_ALIAS` — `rekorder`
+   - `RELEASE_STORE_PASS` — your keystore password
+   - `RELEASE_KEY_PASS` — your key password
+
+---
+
+## Step 2 — Push to GitHub (`loredcast/rekorder`) and Tag `v1.0.0`
+
+Create an empty public repository named `rekorder` under `https://github.com/loredcast`, add the 4 secrets above, then push `main` and the `v1.0.0` tag:
 
 ```bash
-git remote add origin https://github.com/loredcast/rekorder.git
 git push -u origin main
 git push origin v1.0.0
 ```
 
-*(Optionally create a GitHub Release on `v1.0.0` attaching `build/rekorder.apk` signed with your own release key.)*
+Pushing `v1.0.0` triggers GitHub Actions to run all C + JVM unit tests, verify bit-for-byte build reproducibility, sign `rekorder-v1.0.0.apk`, and publish the GitHub Release using `fastlane/metadata/android/en-US/changelogs/1.txt`.
 
 ---
 
-## Step 2 — Submit Merge Request to `fdroiddata`
+## Step 3 — Submit Merge Request to `fdroiddata`
 
 1. Sign in to GitLab and fork [https://gitlab.com/fdroid/fdroiddata](https://gitlab.com/fdroid/fdroiddata).
 2. Clone your fork and create a branch for Rekorder:
