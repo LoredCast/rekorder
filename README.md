@@ -5,6 +5,8 @@ Ultra-small (**~359 KB**), zero-dependency, pitch-black (`#000000`) AMOLED Andro
 - **License:** [GNU GPL v3.0 or later](LICENSE) (`GPL-3.0-or-later`)
 - **Privacy:** 100% offline
 
+![preview](preview_screen.png)
+
 ## Highlights
 
 - **Custom Native C AAudio Driver (`librekorder_aaudio.so`, ~8 KB/ABI)**:
