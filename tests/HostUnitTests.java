@@ -335,6 +335,15 @@ public final class HostUnitTests {
         check(snr > 50.0, "Resampler 96k->48k 1kHz purity SNR=" + snr + " dB");
     }
 
+    private static boolean hasFfprobe() {
+        try {
+            Process p = new ProcessBuilder("ffprobe", "-version").start();
+            return p.waitFor() == 0;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     private static void testOggMuxerOpus() throws Exception {
         File tmp = File.createTempFile("rek_ogg_", ".ogg");
         tmp.deleteOnExit();
@@ -356,18 +365,29 @@ public final class HostUnitTests {
             check(mux.getTotalBytesWritten() > 1500, "Ogg file written");
         }
 
+        // Always verify OggS page capture pattern and OpusHead/OpusTags framing in pure Java
+        byte[] rawOgg;
+        try (FileInputStream fis = new FileInputStream(tmp)) {
+            rawOgg = fis.readAllBytes();
+        }
+        String rawStr = new String(rawOgg, java.nio.charset.StandardCharsets.ISO_8859_1);
+        check(rawStr.startsWith("OggS") && rawStr.contains("OpusHead") && rawStr.contains("OpusTags"),
+                "OggS/OpusHead/OpusTags framing valid");
+
         // Verify exact OggS magic + CRC via ffprobe if available
-        Process p = new ProcessBuilder("ffprobe", "-v", "error", "-select_streams", "a:0",
-                "-show_entries", "stream=codec_name,sample_rate,channels",
-                "-of", "default=noprint_wrappers=1", tmp.getAbsolutePath()).start();
-        byte[] outBytes = p.getInputStream().readAllBytes();
-        byte[] errBytes = p.getErrorStream().readAllBytes();
-        int rc = p.waitFor();
-        String err = new String(errBytes);
-        String out = new String(outBytes);
-        check(rc == 0 && err.isEmpty(), "ffprobe Ogg Opus check failed: " + err);
-        check(out.contains("codec_name=opus") && out.contains("sample_rate=48000") && out.contains("channels=1"),
-                "ffprobe Ogg Opus metadata: " + out);
+        if (hasFfprobe()) {
+            Process p = new ProcessBuilder("ffprobe", "-v", "error", "-select_streams", "a:0",
+                    "-show_entries", "stream=codec_name,sample_rate,channels",
+                    "-of", "default=noprint_wrappers=1", tmp.getAbsolutePath()).start();
+            byte[] outBytes = p.getInputStream().readAllBytes();
+            byte[] errBytes = p.getErrorStream().readAllBytes();
+            int rc = p.waitFor();
+            String err = new String(errBytes);
+            String out = new String(outBytes);
+            check(rc == 0 && err.isEmpty(), "ffprobe Ogg Opus check failed: " + err);
+            check(out.contains("codec_name=opus") && out.contains("sample_rate=48000") && out.contains("channels=1"),
+                    "ffprobe Ogg Opus metadata: " + out);
+        }
     }
 
     /**
@@ -672,11 +692,20 @@ public final class HostUnitTests {
             mux.writePacket(tags, 0, tags.length, 0L, 0);
             mux.writePacket(opusSilence, 0, opusSilence.length, 960L, OggMuxer.FLAG_EOS);
         }
-        Process p = new ProcessBuilder("ffprobe", "-v", "error", "-show_entries", "stream_tags",
-                "-of", "default=noprint_wrappers=1", tmp.getAbsolutePath()).start();
-        String out = new String(p.getInputStream().readAllBytes());
-        String err = new String(p.getErrorStream().readAllBytes());
-        check(p.waitFor() == 0 && err.isEmpty(), "ffprobe OpusTags check failed: " + err);
-        check(out.contains("Studio Take") && out.contains("Rekorder"), "OpusTags metadata parsed by ffprobe: " + out);
+        byte[] rawOgg;
+        try (FileInputStream fis = new FileInputStream(tmp)) {
+            rawOgg = fis.readAllBytes();
+        }
+        String rawStr = new String(rawOgg, java.nio.charset.StandardCharsets.ISO_8859_1);
+        check(rawStr.contains("TITLE=Studio Take") && rawStr.contains("ARTIST=Rekorder"),
+                "OpusTags raw VorbisComment fields present");
+        if (hasFfprobe()) {
+            Process p = new ProcessBuilder("ffprobe", "-v", "error", "-show_entries", "stream_tags",
+                    "-of", "default=noprint_wrappers=1", tmp.getAbsolutePath()).start();
+            String out = new String(p.getInputStream().readAllBytes());
+            String err = new String(p.getErrorStream().readAllBytes());
+            check(p.waitFor() == 0 && err.isEmpty(), "ffprobe OpusTags check failed: " + err);
+            check(out.contains("Studio Take") && out.contains("Rekorder"), "OpusTags metadata parsed by ffprobe: " + out);
+        }
     }
 }

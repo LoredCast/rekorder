@@ -56,6 +56,8 @@ jobs:
 
       - name: Run native C & JVM unit tests
         run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends ffmpeg
           clang -O2 -Wall -Wextra -Inative tests/test_spsc_ring.c -lpthread -o /tmp/test_spsc_ring
           /tmp/test_spsc_ring
           clang -O2 -Wall -Wextra -Inative native/mp3_encoder.c tests/test_mp3_encoder.c -lm -o /tmp/test_mp3_encoder
