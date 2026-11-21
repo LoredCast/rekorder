@@ -1,10 +1,9 @@
 # Rekorder
 
-Ultra-small (**~359 KB**), zero-dependency, pitch-black (`#000000`) AMOLED Android audio recorder engineered for **raw, lossless, unprocessed audio capture** from built-in microphones or USB audio interfaces — with built-in **WAV**, **FLAC**, **OGG Opus**, **MP3**, **RAW PCM**, a studio **Preamp + EQ + Compressor + Normalizer** DSP chain, **independent input & output routing**, non-destructive **Trim & Export**, and crash-safe long-take reliability.
+Ultra-small (**~359 KB**), zero-dependency, pitch-black (`#000000`) AMOLED Android audio recorder engineered for **raw, lossless, unprocessed audio capture** from built-in microphones or USB audio interfaces, with built-in **WAV**, **FLAC**, **OGG Opus**, **MP3**, **RAW PCM**, a studio **Preamp + EQ + Compressor + Normalizer** DSP chain, **independent input & output routing**, non-destructive **Trim & Export**, and crash-safe long-take reliability.
 
 - **License:** [GNU GPL v3.0 or later](LICENSE) (`GPL-3.0-or-later`)
-- **Privacy:** 100% offline — zero third-party libraries, zero ads, zero trackers, zero `INTERNET` permission
-- **Source:** https://github.com/loredcast/rekorder
+- **Privacy:** 100% offline
 
 ## Highlights
 
@@ -49,8 +48,6 @@ Requires only JDK 17+, `clang` + `lld` (from system packages or Android NDK), `z
 ./build.sh
 adb install -r build/rekorder.apk
 ```
-
-See [FDROID_SUBMISSION.md](FDROID_SUBMISSION.md) for the F-Droid metadata recipe (`fdroid/com.rekorder.app.yml`) and publishing steps.
 
 ## Host Unit Tests
 
