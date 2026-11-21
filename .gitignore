@@ -1,0 +1,29 @@
+# Build outputs & intermediate artifacts (F-Droid Inclusion Policy: no prebuilt binaries in VCS)
+/build/
+/app/build/
+/.gradle/
+/native/.cxx/
+/app/.cxx/
+local.properties
+
+# Compiled binaries & packages
+*.apk
+*.aab
+*.idsig
+*.dex
+*.class
+*.so
+*.o
+*.a
+
+# Signing keys & credentials
+*.keystore
+*.jks
+
+# IDE & OS metadata
+.idea/
+*.iml
+.vscode/
+.DS_Store
+Thumbs.db
+*~

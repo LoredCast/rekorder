@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Rekorder</string>
+    <string name="notif_channel_name">Raw Audio Recording</string>
+    <string name="notif_playback_channel_name">Background Audio Playback</string>
+    <string name="notif_recording">Recording raw audio</string>
+    <string name="notif_paused">Recording paused</string>
+    <string name="notif_stop">Stop</string>
+</resources>

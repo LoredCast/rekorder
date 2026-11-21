@@ -1,0 +1,25 @@
+Categories:
+  - Multimedia
+License: GPL-3.0-or-later
+AuthorName: loredcast
+SourceCode: https://github.com/loredcast/rekorder
+IssueTracker: https://github.com/loredcast/rekorder/issues
+Changelog: https://github.com/loredcast/rekorder/releases
+
+RepoType: git
+Repo: https://github.com/loredcast/rekorder.git
+
+Builds:
+  - versionName: 1.0.0
+    versionCode: 1
+    commit: v1.0.0
+    ndk: r27c
+    output: build/rekorder-unsigned.apk
+    build:
+      - ANDROID_NDK_HOME=$$NDK$$ ./build.sh --unsigned
+
+AutoUpdateMode: Version
+UpdateCheckMode: Tags
+UpdateCheckData: app/src/main/AndroidManifest.xml|android:versionCode="(\d+)"|.|android:versionName="([^"]+)"
+CurrentVersion: 1.0.0
+CurrentVersionCode: 1

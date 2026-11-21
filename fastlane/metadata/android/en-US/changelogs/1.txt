@@ -1,0 +1,7 @@
+Initial 1.0.0 release:
+• Custom C AAudio low-latency driver with lock-free 2 MiB ring buffer
+• WAV (16/24/32f), FLAC, OGG Opus, pure-C MP3 & RAW PCM capture
+• Independent input & output device routing (e.g. USB mic in + Phone Speaker out)
+• Studio DSP chain: Preamp, 5-Band EQ, Soft-Knee Compressor, 2-Pass True Peak Normalizer & presets
+• Crash-safe WAV checkpointing, 4 GiB auto-split & orphaned scratch recovery
+• 32x zoom waveform, bookmarks, non-destructive Trim/Export & background player

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="amoled_black">#000000</color>
+    <color name="amoled_surface">#0A0A0A</color>
+    <color name="amoled_surface_raised">#121212</color>
+    <color name="amoled_border">#1E1E1E</color>
+    <color name="text_primary">#F2F2F2</color>
+    <color name="text_secondary">#7A7A7A</color>
+    <color name="text_muted">#4A4A4A</color>
+    <color name="accent_record">#FF2D2D</color>
+    <color name="accent_warn">#FFB800</color>
+    <color name="accent_play">#00E5A0</color>
+</resources>

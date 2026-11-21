@@ -1,0 +1,27 @@
+Rekorder is an ultra-small (~359 KB), zero-dependency, pitch-black (#000000) AMOLED audio recorder for Android engineered for bit-accurate, unprocessed audio capture from built-in microphones, wired headsets, or external USB audio interfaces.
+
+<b>Core Highlights</b>
+• <b>Custom Native C AAudio Driver:</b> Talks directly to Android's system libaaudio.so using an exclusive low-latency MMAP path and a lock-free C11 SPSC ring buffer (2 MiB) so the real-time audio callback performs zero locks, zero allocations, and zero JNI calls. Includes automatic fallback to direct AudioRecord.
+• <b>Lossless & Compressed Formats:</b>
+  - WAV 24-bit PCM, WAV 32-bit IEEE Float, WAV 16-bit PCM
+  - FLAC Lossless (.flac) with exact STREAMINFO sample patching
+  - OGG Opus (.ogg, 128–320 kbps) with RFC 7845 OpusTags metadata
+  - MP3 (.mp3, 128–320 kbps CBR) via a built-in freestanding pure-C MPEG-1 Layer III encoder with ID3v2.3 tags
+  - RAW 32-bit Float & RAW 24-bit PCM (.pcm)
+• <b>Independent Input & Output Routing:</b> Pin your recording input (e.g. USB condenser mic) independently from playback/monitoring output (e.g. Phone Speaker or Wired Headphones) so connecting a USB mic never hijacks speaker playback.
+• <b>Studio DSP Chain & Auto-Apply Presets:</b>
+  - Input Preamp Gain (-12 dB to +24 dB)
+  - High-Pass Filter (80 / 120 Hz Butterworth) + 5-Band Parametric Equalizer (80 Hz, 250 Hz, 1 kHz, 4 kHz, 10 kHz, ±12 dB, 64-bit internal precision)
+  - Soft-Knee Feed-Forward Compressor with live gain-reduction (GR dB) metering
+  - Exact 2-Pass True Peak Normalizer (-0.5 / -1.0 / -3.0 / -6.0 dBFS)
+  - Built-in & custom presets with optional Auto-Apply on Record (or 100% bit-exact raw capture when bypassed)
+• <b>Extreme Long-Take Reliability:</b>
+  - 15-second crash-safe WAV header checkpointing & automatic 4 GiB seamless multi-part WAV splitting
+  - Automatic startup recovery of interrupted takes into lossless WAV files
+  - Seamless mid-recording microphone hot-plug auto-reconnect
+  - Multi-tier encoder fallback that rescues audio to lossless WAV if a hardware codec ever fails
+• <b>Interactive Waveform, Trim & Background Playback:</b>
+  - Dual-layer Peak + RMS waveform with up to 32x horizontal pinch-zoom, live recording bookmarks (+ MARK), and stereo L/R level meters
+  - Non-destructive offline Trim, post-hoc DSP processing, and format conversion/export
+  - Full background playback service with lock-screen MediaSession controls, 0.5x–2.0x playback speed, and Quick Settings Record Tile
+• <b>100% Offline & Private:</b> Zero third-party libraries, zero ads, zero trackers, and does not request INTERNET permission.
