@@ -1,13 +1,13 @@
 Categories:
   - Multimedia
 License: GPL-3.0-or-later
-AuthorName: loredcast
-SourceCode: https://github.com/loredcast/rekorder
-IssueTracker: https://github.com/loredcast/rekorder/issues
-Changelog: https://github.com/loredcast/rekorder/releases
+AuthorName: LoredCast
+SourceCode: https://github.com/LoredCast/rekorder
+IssueTracker: https://github.com/LoredCast/rekorder/issues
+Changelog: https://github.com/LoredCast/rekorder/releases
 
 RepoType: git
-Repo: https://github.com/loredcast/rekorder.git
+Repo: https://github.com/LoredCast/rekorder.git
 
 Builds:
   - versionName: 1.0.0

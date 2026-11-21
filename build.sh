@@ -48,10 +48,10 @@ if [[ -z "$SDK_DIR" || ! -d "$SDK_DIR/platforms" ]]; then
     exit 1
 fi
 
-# 3. Locate clang/lld/readelf (prefer explicitly configured Android NDK if present, else PATH)
+# 3. Locate clang/lld/readelf (prefer explicit ANDROID_NDK_HOME if set, else ANDROID_NDK / PATH)
 NDK_LLVM_BIN=""
 NDK_SYSROOT_INC=""
-for ndk_cand in "${ANDROID_NDK:-}" "${ANDROID_NDK_HOME:-}" "${ANDROID_NDK_LATEST_HOME:-}" "${NDK:-}" "$SDK_DIR"/ndk/*; do
+for ndk_cand in "${ANDROID_NDK_HOME:-}" "${ANDROID_NDK:-}" "${ANDROID_NDK_LATEST_HOME:-}" "${NDK:-}" "$SDK_DIR"/ndk/*; do
     if [[ -n "$ndk_cand" && -x "$ndk_cand/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" ]]; then
         NDK_LLVM_BIN="$ndk_cand/toolchains/llvm/prebuilt/linux-x86_64/bin"
         NDK_SYSROOT_INC="$ndk_cand/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/include"
@@ -101,6 +101,7 @@ VERSION_NAME="${VERSION_NAME:-1.0.0}"
 echo "==> SDK        : $SDK_DIR"
 echo "==> BuildTools : $BUILD_TOOLS_VER"
 echo "==> Platform   : $PLATFORM_JAR"
+echo "==> Clang      : $(command -v clang)"
 echo "==> JDK        : $(javac -version 2>&1)"
 echo "==> Version    : $VERSION_NAME ($VERSION_CODE)"
 

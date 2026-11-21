@@ -87,7 +87,7 @@ jobs:
           KEYSTORE_FILE="$(mktemp /tmp/rekorder-release.XXXXXX.keystore)"
           trap 'rm -f "$KEYSTORE_FILE"' EXIT
           chmod 600 "$KEYSTORE_FILE"
-          printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 -d > "$KEYSTORE_FILE"
+          printf '%s' "$RELEASE_KEYSTORE_BASE64" | tr -d '[:space:]' | base64 -d > "$KEYSTORE_FILE"
 
           RELEASE_KEYSTORE="$KEYSTORE_FILE" \
           OUT_APK="$RELEASE_APK" \
